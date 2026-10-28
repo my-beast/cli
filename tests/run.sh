@@ -72,6 +72,7 @@ check 'commit' same "$(field "$ROOT/state/started.json" commit)" "$SHA"
 check 'commit subject' same "$(field "$ROOT/state/started.json" commit_subject)" 'Ship "the" thing'
 check 'branch' same "$(field "$ROOT/state/started.json" branch)" main
 check 'a clean checkout' same "$(field "$ROOT/state/started.json" dirty)" 0
+check 'its last commits' same "$(field "$ROOT/state/started.json" commits)" "$SHA"$'\t''Anna Test'$'\t''Ship "the" thing'
 check 'who' same "$(field "$ROOT/state/started.json" actor_name)" 'Anna Test'
 check 'their e-mail' same "$(field "$ROOT/state/started.json" actor_email)" anna@example.test
 check 'the machine' same "$(field "$ROOT/state/started.json" machine)" "$(hostname -s 2>/dev/null || uname -n)"

@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION=1
+VERSION=2
 SELF=${0##*/}
 
 say() { printf '%s: %s\n' "$SELF" "$*" >&2; }
@@ -176,11 +176,13 @@ shown_command() {
 
 # What the machine says about itself: the commit and the person, as git and the system know them.
 facts() {
-    COMMIT='' BRANCH='' SUBJECT='' DIRTY=0
+    COMMIT='' BRANCH='' SUBJECT='' DIRTY=0 COMMITS=''
     if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         COMMIT=$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)
         BRANCH=$(git symbolic-ref --short --quiet HEAD 2>/dev/null || true)
         [ -z "$COMMIT" ] || SUBJECT=$(git log -1 --format=%s 2>/dev/null || true)
+        # The last commits, a line each (hash, author, subject): the service keeps the ones since what is live.
+        [ -z "$COMMIT" ] || [ "$MODE" = rollback ] || COMMITS=$(git log -n 50 --format='%H%x09%an%x09%s' 2>/dev/null || true)
         [ -z "$(git status --porcelain 2>/dev/null | head -1)" ] || DIRTY=1
     fi
     ACTOR_NAME=$(git config user.name 2>/dev/null || true)
@@ -328,6 +330,7 @@ register() { # → DEPLOY_ID, DEPLOY_URL, DEPLOY_TITLE (empty when the service d
         ${COMMIT:+--data-urlencode "commit=$COMMIT"} \
         --data-urlencode "commit_subject=$SUBJECT" \
         --data-urlencode "branch=$BRANCH" \
+        ${COMMITS:+--data-urlencode "commits=$COMMITS"} \
         --data-urlencode "dirty=$DIRTY" \
         --data-urlencode "actor_name=$ACTOR_NAME" \
         --data-urlencode "actor_email=$ACTOR_EMAIL" \

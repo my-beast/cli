@@ -33,6 +33,8 @@ mybeast-deploy status --app asuvaan --env staging
 - `--release NAME` names the build when its log does not (the service finds `==> Building …` in Asuvaan's and
   my-beast.com's logs by itself). `rollback --to RELEASE` hands the command `RELEASE=<release>`, which their
   `make rollback` reads.
+- A deploy sends the checkout's **last 50 commits** (hash, author, subject; from version 2): the service keeps the
+  ones since what is live there, so the deploy's page says what it brings. A rollback sends none.
 - The command **keeps the terminal**: its prompts (the deploy password, "type production", "type fresh") work as
   without the wrapper, and what is typed there never reaches the service. Its output goes to the terminal at once and
   to the service every 2 s (colours and all; the service shows it plain). A batch whose answer is lost is sent again
