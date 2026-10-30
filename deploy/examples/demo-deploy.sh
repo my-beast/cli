@@ -2,9 +2,9 @@
 # A stand-in deploy for trying mybeast-deploy: it talks like a typical deploy/deploy.sh (`==>` steps
 # in bold, warnings in yellow, a progress bar redrawn with \r) and deploys nothing.
 #
-#   mybeast-deploy run --app demo --env staging -- deploys/cli/examples/demo-deploy.sh
-#   mybeast-deploy run --app demo --env staging -- deploys/cli/examples/demo-deploy.sh --fail
-#   ... -- deploys/cli/examples/demo-deploy.sh --ask       (asks for a "deploy password" first, on the terminal)
+#   mybeast-deploy run --app demo --env staging -- examples/demo-deploy.sh
+#   mybeast-deploy run --app demo --env staging -- examples/demo-deploy.sh --fail
+#   ... -- examples/demo-deploy.sh --ask       (asks for a "deploy password" first, on the terminal)
 set -euo pipefail
 
 say()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
