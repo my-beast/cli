@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A stand-in deploy for trying mybeast-deploy: it talks like Asuvaan's and my-beast.com's deploy/deploy.sh (`==>` steps
+# A stand-in deploy for trying mybeast-deploy: it talks like a typical deploy/deploy.sh (`==>` steps
 # in bold, warnings in yellow, a progress bar redrawn with \r) and deploys nothing.
 #
 #   mybeast-deploy run --app demo --env staging -- deploys/cli/examples/demo-deploy.sh

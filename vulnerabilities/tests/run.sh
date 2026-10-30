@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The CLI's tests: mybeast-vulnerabilities against a stand-in of the service's API (tests/fake-service.php, php -S), in
-# a throwaway git checkout laid out as Asuvaan (lock files at the top) and my-beast.com (backend/, frontend/) are. Run
+# a throwaway git checkout laid out both ways an app may be (lock files at the top, or in backend/ and frontend/). Run
 # it with the bash the CLI must work with: `/bin/bash tests/run.sh` (3.2 on macOS).
 
 set -uo pipefail
@@ -68,10 +68,10 @@ lacks() { case $1 in *"$2"*) printf '    %q\n    holds %q\n' "$1" "$2" >&2; retu
 
 # --- a push from the app's folder: the lock files there, the commit, byte for byte
 fresh
-out=$(cli push --app asuvaan --env production 2>"$ROOT/err")
+out=$(cli push --app shop --env production 2>"$ROOT/err")
 code=$?
 check 'a push ends 0' same "$code" 0
-check 'app' same "$(field "$ROOT/state/fields.json" app)" asuvaan
+check 'app' same "$(field "$ROOT/state/fields.json" app)" shop
 check 'environment' same "$(field "$ROOT/state/fields.json" environment)" production
 check 'commit' same "$(field "$ROOT/state/fields.json" commit)" "$SHA"
 check 'branch' same "$(field "$ROOT/state/fields.json" branch)" main
@@ -82,8 +82,8 @@ check 'package-lock.json as it is' same "$(cat "$ROOT/state/files/npm-0-lock")" 
 check 'under their own names' same "$(field "$ROOT/state/names.json" composer-0-lock)$(field "$ROOT/state/names.json" npm-0-lock)" 'composer.lockpackage-lock.json'
 check 'and where they were read' same "$(field "$ROOT/state/fields.json" composer.0.path) $(field "$ROOT/state/fields.json" npm.0.path)" 'composer.lock package-lock.json'
 check 'nothing open is said' has "$out" 'Nothing open.'
-check 'what was taken' has "$out" "asuvaan · production: 417 packages from ${SHA:0:7}, 2 lock files; 2 new, 1 fixed since the last push."
-check 'and the page' has "$out" 'http://vulnerabilities.test/projects/p/apps/asuvaan/production'
+check 'what was taken' has "$out" "shop · production: 417 packages from ${SHA:0:7}, 2 lock files; 2 new, 1 fixed since the last push."
+check 'and the page' has "$out" 'http://vulnerabilities.test/projects/p/apps/shop/production'
 
 # --- my-beast.com's layout: named lock files, each composer.lock with the composer.json beside it
 fresh
@@ -98,70 +98,70 @@ check 'nothing else' same "$(ls "$ROOT/state/files" | tr '\n' ' ')" 'composer-0-
 fresh
 printf '%s' '{"critical":0,"high":1,"medium":2,"low":0,"unrated":1}' >"$ROOT/state/findings.json"
 printf 'HIGH      acme/http-client v2.3.0  CVE-2026-1001 (GHSA-fx01)  fixed in 2.4.1\nMEDIUM    b 2.0.0  GHSA-x  "quoted" \\ fixed in 2.0.1, through another package\n' >"$ROOT/state/report.txt"
-out=$(cli push --app asuvaan --env production 2>"$ROOT/err")
+out=$(cli push --app shop --env production 2>"$ROOT/err")
 check 'without --fail-on it ends 0' same "$?" 0
 check 'it counts what is open' has "$out" '4 open: 1 high, 2 medium, 1 not rated'
 check 'one line each' has "$out" '  HIGH      acme/http-client v2.3.0  CVE-2026-1001 (GHSA-fx01)  fixed in 2.4.1'
 check 'quotes and backslashes as they were' has "$out" '  MEDIUM    b 2.0.0  GHSA-x  "quoted" \ fixed in 2.0.1, through another package'
-cli push --app asuvaan --env production --fail-on high >/dev/null 2>"$ROOT/err"
+cli push --app shop --env production --fail-on high >/dev/null 2>"$ROOT/err"
 check '--fail-on high with a high open ends 1' same "$?" 1
 check 'and says why' has "$(cat "$ROOT/err")" 'a finding at high or worse is open (--fail-on high)'
-cli push --app asuvaan --env production --fail-on critical >/dev/null 2>&1
+cli push --app shop --env production --fail-on critical >/dev/null 2>&1
 check '--fail-on critical with none critical ends 0' same "$?" 0
-cli push --app asuvaan --env production --fail-on low >/dev/null 2>&1
+cli push --app shop --env production --fail-on low >/dev/null 2>&1
 check '--fail-on low with a medium open ends 1' same "$?" 1
-cli push --app asuvaan --env production --fail-on severe >/dev/null 2>"$ROOT/err"
+cli push --app shop --env production --fail-on severe >/dev/null 2>"$ROOT/err"
 check 'an unknown severity is its own refusal' same "$?" 2
 
 # --- status: the last push, without pushing
 fresh
 printf '%s' '{"critical":1,"high":0,"medium":0,"low":0,"unrated":0}' >"$ROOT/state/findings.json"
-out=$(cli status --app asuvaan --env production --fail-on high 2>"$ROOT/err")
+out=$(cli status --app shop --env production --fail-on high 2>"$ROOT/err")
 code=$?
 check 'status with a critical open and --fail-on high ends 1' same "$code" 1
-check 'status says when and what' has "$out" 'asuvaan · production: last pushed 2026-10-27T12:00:00+00:00 from abcdef1, 417 packages.'
+check 'status says when and what' has "$out" 'shop · production: last pushed 2026-10-27T12:00:00+00:00 from abcdef1, 417 packages.'
 check 'status sent nothing' same "$(grep -c '^POST' "$ROOT/state/requests" 2>/dev/null || true)" 0
-cli status --app asuvaan --env staging >/dev/null 2>"$ROOT/err"
+cli status --app shop --env staging >/dev/null 2>"$ROOT/err"
 check 'no push there yet ends 3' same "$?" 3
-check 'and says so' has "$(cat "$ROOT/err")" 'asuvaan has pushed nothing to staging yet.'
+check 'and says so' has "$(cat "$ROOT/err")" 'shop has pushed nothing to staging yet.'
 
 # --- the secret never on a command line: curl gets it on its standard input
 fresh
 mkdir -p "$ROOT/shim"
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/curl-args"\nexec "%s" "$@"\n' "$ROOT/state" "$(command -v curl)" >"$ROOT/shim/curl"
 chmod +x "$ROOT/shim/curl"
-PATH="$ROOT/shim:$PATH" cli push --app asuvaan --env production >/dev/null 2>&1
+PATH="$ROOT/shim:$PATH" cli push --app shop --env production >/dev/null 2>&1
 check 'curl ran' [ -s "$ROOT/state/curl-args" ]
 check 'without the secret in its arguments' lacks "$(cat "$ROOT/state/curl-args")" 'secret-secret'
 
 # --- refusals: no lock file, a wrong name, a bad answer, the service down, a wrong secret
 fresh
-(cd "$REPO/empty" && cli push --app asuvaan --env production >/dev/null 2>"$ROOT/err")
+(cd "$REPO/empty" && cli push --app shop --env production >/dev/null 2>"$ROOT/err")
 check 'no lock file here ends 2' same "$?" 2
 check 'and says where it looked' has "$(cat "$ROOT/err")" 'no composer.lock or package-lock.json here'
 check 'nothing was sent' [ ! -e "$ROOT/state/requests" ]
-cli push --app asuvaan --env production --lock yarn.lock >/dev/null 2>"$ROOT/err"
+cli push --app shop --env production --lock yarn.lock >/dev/null 2>"$ROOT/err"
 check 'a lock file it does not read' has "$(cat "$ROOT/err")" '--lock yarn.lock: no such file'
 touch "$REPO/yarn.lock"
-cli push --app asuvaan --env production --lock yarn.lock >/dev/null 2>"$ROOT/err"
+cli push --app shop --env production --lock yarn.lock >/dev/null 2>"$ROOT/err"
 check 'yarn is not read yet' has "$(cat "$ROOT/err")" 'yarn and pnpm are not read yet'
 rm "$REPO/yarn.lock"
-cli push --app Asuvaan --env production >/dev/null 2>"$ROOT/err"
+cli push --app Shop --env production >/dev/null 2>"$ROOT/err"
 check 'a bad app name' has "$(cat "$ROOT/err")" '--app: lower-case'
 printf 'package-lock.json is lockfileVersion 1: only 2 and 3 are read.' >"$ROOT/state/refuse"
-cli push --app asuvaan --env production >/dev/null 2>"$ROOT/err"
+cli push --app shop --env production >/dev/null 2>"$ROOT/err"
 check 'a refusal ends 3' same "$?" 3
 check 'and passes on its word' has "$(cat "$ROOT/err")" '422: package-lock.json is lockfileVersion 1: only 2 and 3 are read.'
 rm "$ROOT/state/refuse" && touch "$ROOT/state/down"
-cli push --app asuvaan --env production >/dev/null 2>"$ROOT/err"
+cli push --app shop --env production >/dev/null 2>"$ROOT/err"
 check 'the service down ends 3' same "$?" 3
 check 'and says it was not sent' has "$(cat "$ROOT/err")" 'not sent:'
 rm "$ROOT/state/down"
 env HOME="$ROOT/home" MYBEAST_VULNERABILITIES_CONFIG="$ROOT/none" MYBEAST_VULNERABILITIES_URL="http://127.0.0.1:$PORT" MYBEAST_VULNERABILITIES_SECRET='sk_wrong.wrong' \
-    "$CLI" push --app asuvaan --env production >/dev/null 2>"$ROOT/err"
+    "$CLI" push --app shop --env production >/dev/null 2>"$ROOT/err"
 check 'a wrong secret' has "$(cat "$ROOT/err")" 'the secret was refused'
 env HOME="$ROOT/home" MYBEAST_VULNERABILITIES_CONFIG="$ROOT/none" MYBEAST_VULNERABILITIES_URL="http://example.com" MYBEAST_VULNERABILITIES_SECRET="$KEY" \
-    "$CLI" push --app asuvaan --env production >/dev/null 2>"$ROOT/err"
+    "$CLI" push --app shop --env production >/dev/null 2>"$ROOT/err"
 check 'plain http elsewhere is refused' has "$(cat "$ROOT/err")" 'must be https://'
 
 # --- settings from the config file, which must be private; the _KEY name works too
@@ -170,18 +170,18 @@ mkdir -p "$ROOT/home/.config/mybeast"
 printf 'MYBEAST_VULNERABILITIES_URL=http://127.0.0.1:%s\nexport MYBEAST_VULNERABILITIES_KEY="%s"\n' "$PORT" "$KEY" >"$ROOT/home/.config/mybeast/vulnerabilities.env"
 chmod 644 "$ROOT/home/.config/mybeast/vulnerabilities.env"
 env -u MYBEAST_VULNERABILITIES_URL -u MYBEAST_VULNERABILITIES_SECRET -u MYBEAST_VULNERABILITIES_KEY -u MYBEAST_VULNERABILITIES_CONFIG HOME="$ROOT/home" XDG_CONFIG_HOME= \
-    "$CLI" push --app asuvaan --env production >/dev/null 2>"$ROOT/err"
+    "$CLI" push --app shop --env production >/dev/null 2>"$ROOT/err"
 check 'a file others can read is refused' has "$(cat "$ROOT/err")" 'can be read by others'
 chmod 600 "$ROOT/home/.config/mybeast/vulnerabilities.env"
 env -u MYBEAST_VULNERABILITIES_URL -u MYBEAST_VULNERABILITIES_SECRET -u MYBEAST_VULNERABILITIES_KEY -u MYBEAST_VULNERABILITIES_CONFIG HOME="$ROOT/home" XDG_CONFIG_HOME= \
-    "$CLI" push --app asuvaan --env production >/dev/null 2>"$ROOT/err"
-check 'the settings come from the file' same "$(field "$ROOT/state/fields.json" app)" asuvaan
+    "$CLI" push --app shop --env production >/dev/null 2>"$ROOT/err"
+check 'the settings come from the file' same "$(field "$ROOT/state/fields.json" app)" shop
 
 # --- outside a checkout: the CI's commit
 fresh
 cp composer.lock composer.json "$ROOT/home/"
 (cd "$ROOT/home" && env GITHUB_SHA=0123456789abcdef0123456789abcdef01234567 HOME="$ROOT/home" MYBEAST_VULNERABILITIES_CONFIG="$ROOT/none" \
-    MYBEAST_VULNERABILITIES_URL="http://127.0.0.1:$PORT" MYBEAST_VULNERABILITIES_SECRET="$KEY" GIT_CEILING_DIRECTORIES="$ROOT" "$CLI" push --app asuvaan --env production >/dev/null 2>&1)
+    MYBEAST_VULNERABILITIES_URL="http://127.0.0.1:$PORT" MYBEAST_VULNERABILITIES_SECRET="$KEY" GIT_CEILING_DIRECTORIES="$ROOT" "$CLI" push --app shop --env production >/dev/null 2>&1)
 check 'the commit from CI' same "$(field "$ROOT/state/fields.json" commit)" 0123456789abcdef0123456789abcdef01234567
 
 printf '%s passed, %s failed\n' "$PASSED" "$FAILED"

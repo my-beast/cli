@@ -168,7 +168,7 @@ parse() { # → APP ENVIRONMENT LOCKS COMMIT FAIL_ON
             *) die "$MODE does not take $1 (see $SELF --help)" ;;
         esac
     done
-    [[ $APP =~ ^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$ ]] || die "--app: lower-case letters, digits and inner dashes (e.g. --app asuvaan)"
+    [[ $APP =~ ^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$ ]] || die "--app: lower-case letters, digits and inner dashes (e.g. --app shop)"
     [[ $ENVIRONMENT =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || die "--env: lower-case letters, digits, - and _ (e.g. --env production)"
     case $FAIL_ON in
         '' | critical | high | medium | low) ;;

@@ -1,0 +1,40 @@
+# A tag v<version> makes the GitHub release: the three commands as files, and SHA256SUMS to check them against.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php: '8.4'
+          coverage: none
+      - run: git config --global user.name 'CI' && git config --global user.email 'ci@example.test'
+      - run: /bin/bash test.sh
+
+  release:
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The files and their sums
+        run: |
+          mkdir dist
+          cp deploy/mybeast-deploy secrets/mybeast-secrets vulnerabilities/mybeast-vulnerabilities dist/
+          chmod 755 dist/mybeast-*
+          (cd dist && sha256sum mybeast-* > SHA256SUMS && cat SHA256SUMS)
+      - name: The release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes "See CHANGELOG.md."

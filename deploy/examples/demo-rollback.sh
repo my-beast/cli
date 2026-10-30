@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A stand-in rollback for trying mybeast-deploy rollback, in the words of Asuvaan's `make rollback:staging`. Goes back
+# A stand-in rollback for trying mybeast-deploy rollback, in the words of a typical `make rollback:staging`. Goes back
 # to RELEASE when it is given (mybeast-deploy rollback --to <release> hands it over), else one release back.
 #
 #   mybeast-deploy rollback --app demo --env staging -- deploys/cli/examples/demo-rollback.sh
