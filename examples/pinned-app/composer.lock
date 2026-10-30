@@ -1,0 +1,21 @@
+{
+    "_readme": [
+        "Written by hand for mybeast-vulnerabilities' example: guzzlehttp/guzzle 7.4.4 has published advisories (GHSA-25mq-v84q-4j7r, fixed in 7.4.5)."
+    ],
+    "content-hash": "pinned-app",
+    "packages": [
+        {"name": "guzzlehttp/guzzle", "version": "7.4.4", "type": "library", "license": ["MIT"]},
+        {"name": "guzzlehttp/promises", "version": "1.5.1", "type": "library", "license": ["MIT"]},
+        {"name": "guzzlehttp/psr7", "version": "2.4.0", "type": "library", "license": ["MIT"]},
+        {"name": "psr/http-client", "version": "1.0.1", "type": "library", "license": ["MIT"]}
+    ],
+    "packages-dev": [],
+    "aliases": [],
+    "minimum-stability": "stable",
+    "stability-flags": {},
+    "prefer-stable": true,
+    "prefer-lowest": false,
+    "platform": {"php": "^8.2"},
+    "platform-dev": {},
+    "plugin-api-version": "2.6.0"
+}

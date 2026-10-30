@@ -1,0 +1,10 @@
+{
+    "name": "mybeast/pinned-app",
+    "description": "An app pinned to releases with published advisories, for trying mybeast-vulnerabilities. Never installed.",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": "^8.2",
+        "guzzlehttp/guzzle": "7.4.4"
+    }
+}
