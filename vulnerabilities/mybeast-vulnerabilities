@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# mybeast-vulnerabilities - an app's lock files sent to MyBeast Vulnerabilities from its deploy script or CI: what it
+# runs in an environment, matched there against the public advisories; what is open comes back.
+#
+#   mybeast-vulnerabilities push --app APP --env ENV [--lock FILE]... [--commit SHA] [--fail-on SEVERITY]
+#   mybeast-vulnerabilities status --app APP --env ENV [--fail-on SEVERITY]
+#
+# Reads MYBEAST_VULNERABILITIES_URL (e.g. https://services.my-beast.com/vulnerabilities) and
+# MYBEAST_VULNERABILITIES_SECRET (sk_….…, the project's Settings → Keys, or the one id put in Secrets), from the
+# environment or from ~/.config/mybeast/vulnerabilities.env. Bash and curl, nothing else; bash 3.2 (macOS) and up.
+# The secret goes to curl on its standard input, never on its command line.
+#
+# The service reads the files and keeps only each package's name, version, licence and whether it is direct or for
+# development - never the files. Exit codes: 0 sent (nothing open at --fail-on or worse), 1 something open at
+# --fail-on or worse, 2 its own refusals (a bad option, no lock file, no settings), 3 the service did not take it.
+
+set -euo pipefail
+
+VERSION=1
+SELF=${0##*/}
+CONFIG_HINT='~/.config/mybeast/vulnerabilities.env'
+WORK=
+
+say() { printf '%s: %s\n' "$SELF" "$*" >&2; }
+die() {
+    say "$*"
+    exit 2
+}
+
+usage() {
+    cat <<EOF
+$SELF $VERSION - send an app's lock files to MyBeast Vulnerabilities and see what is open
+
+  $SELF push --app APP --env ENV [--lock FILE]... [--commit SHA] [--fail-on SEVERITY]
+      Sends composer.lock (with the composer.json beside it) and package-lock.json - the ones in this folder, or
+      each --lock given (e.g. --lock backend/composer.lock --lock frontend/package-lock.json) - with the commit.
+      What runs in ENV is then what they say; it prints what is open there.
+
+  $SELF status --app APP --env ENV [--fail-on SEVERITY]
+      What is open there since the last push, without pushing.
+
+  --fail-on critical|high|medium|low   end with 1 while a finding this bad or worse is open (for CI)
+
+Needs MYBEAST_VULNERABILITIES_URL and MYBEAST_VULNERABILITIES_SECRET (a server key: the project's Settings → Keys),
+exported or in ${CONFIG_HINT}. Ends with 0, 1 (--fail-on), 2 (its own refusals) or 3 (the service did not take it).
+EOF
+}
+
+cleanup() {
+    if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
+}
+trap cleanup EXIT
+
+# ------------------------------------------------------------------------------------------------------- settings
+
+# A KEY=VALUE file is read, never sourced; it must be readable by its owner only.
+config_value() { # $1 file, $2 name
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line#export }
+        case $line in
+            "$2"=*)
+                line=${line#"$2"=}
+                line=${line%\"}
+                line=${line#\"}
+                line=${line%\'}
+                line=${line#\'}
+                printf '%s' "$line"
+                return 0
+                ;;
+        esac
+    done <"$1"
+}
+
+settings() {
+    local file=${MYBEAST_VULNERABILITIES_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/mybeast/vulnerabilities.env}
+
+    # The name Secrets gives the server key (MYBEAST_VULNERABILITIES_SECRET); _KEY as the other CLIs call it.
+    : "${MYBEAST_VULNERABILITIES_SECRET:=${MYBEAST_VULNERABILITIES_KEY:-}}"
+
+    if { [ -z "${MYBEAST_VULNERABILITIES_URL:-}" ] || [ -z "$MYBEAST_VULNERABILITIES_SECRET" ]; } && [ -f "$file" ]; then
+        if [ -n "$(find "$file" -prune \( -perm -004 -o -perm -040 \) 2>/dev/null)" ]; then
+            die "$file can be read by others: chmod 600 $file"
+        fi
+        : "${MYBEAST_VULNERABILITIES_URL:=$(config_value "$file" MYBEAST_VULNERABILITIES_URL)}"
+        [ -n "$MYBEAST_VULNERABILITIES_SECRET" ] || MYBEAST_VULNERABILITIES_SECRET=$(config_value "$file" MYBEAST_VULNERABILITIES_SECRET)
+        [ -n "$MYBEAST_VULNERABILITIES_SECRET" ] || MYBEAST_VULNERABILITIES_SECRET=$(config_value "$file" MYBEAST_VULNERABILITIES_KEY)
+    fi
+
+    [ -n "${MYBEAST_VULNERABILITIES_URL:-}" ] || die "MYBEAST_VULNERABILITIES_URL is not set (e.g. https://services.my-beast.com/vulnerabilities), nor in $CONFIG_HINT"
+    [ -n "$MYBEAST_VULNERABILITIES_SECRET" ] || die "MYBEAST_VULNERABILITIES_SECRET is not set (a server key: the project's Settings → Keys), nor in $CONFIG_HINT"
+    case $MYBEAST_VULNERABILITIES_URL in
+        https://* | http://localhost* | http://127.0.0.1* | http://*.localhost* | http://*.test*) ;;
+        *) die "MYBEAST_VULNERABILITIES_URL must be https:// (plain http only for localhost, *.localhost and *.test)" ;;
+    esac
+    [[ $MYBEAST_VULNERABILITIES_SECRET =~ ^sk_[a-z0-9]+\.[A-Za-z0-9_-]+$ ]] || die "MYBEAST_VULNERABILITIES_SECRET does not look like a server key (sk_….…)"
+    command -v curl >/dev/null 2>&1 || die "curl is needed"
+
+    URL=${MYBEAST_VULNERABILITIES_URL%/}
+    KEY=$MYBEAST_VULNERABILITIES_SECRET
+    WORK=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/mybeast-vulnerabilities.XXXXXX")
+}
+
+# ------------------------------------------------------------------------------------------------------- the API
+
+# api METHOD PATH OUT [CURL ARGS...] → the HTTP status on stdout (000: no answer); the body in OUT.
+api() {
+    local method=$1 path=$2 out=$3 code
+    shift 3
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$KEY" |
+        curl --silent --show-error --proto '=https,http' --max-time 120 --connect-timeout 10 --config - \
+            --header 'Accept: application/json' --request "$method" --output "$out" --write-out '%{http_code}' \
+            "$@" "$URL$path" 2>>"$WORK/curl.log") || true
+    printf '%s' "${code:-000}"
+}
+
+# json NAME FILE → a field of the answer: a string unescaped (\n a new line), or a number / true / false as written;
+# nothing for null or a missing field. The first one of that name wins: the service's answers name each once.
+json() {
+    local body re value
+    body=$(cat "$2" 2>/dev/null) || return 0
+    re='[{,]"'"$1"'":("(([^"\\]|\\.)*)"|(-?[0-9]+|true|false))'
+    [[ $body =~ $re ]] || return 0
+    if [ -n "${BASH_REMATCH[4]}" ]; then
+        printf '%s' "${BASH_REMATCH[4]}"
+        return 0
+    fi
+    value=${BASH_REMATCH[2]}
+    value=${value//\\\\/$'\001'}
+    value=${value//\\\"/\"}
+    value=${value//\\\//\/}
+    value=${value//\\n/$'\n'}
+    value=${value//\\t/	}
+    value=${value//$'\001'/\\}
+    printf '%s' "$value"
+}
+
+# The service's word on a refusal, for the person.
+said() { # $1 code, $2 file
+    local message
+    message=$(json message "$2")
+    case $1 in
+        000) printf 'could not reach %s (%s)' "$URL" "$(tail -1 "$WORK/curl.log" 2>/dev/null | sed 's/^curl: //')" ;;
+        401) printf 'the secret was refused: revoked, mistyped, or not a Vulnerabilities key of %s' "$URL" ;;
+        413) printf 'a lock file is larger than %s takes' "$URL" ;;
+        *) printf '%s answered %s%s' "$URL" "$1" "${message:+: $message}" ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------------------------- what it sends
+
+parse() { # → APP ENVIRONMENT LOCKS COMMIT FAIL_ON
+    APP='' ENVIRONMENT='' COMMIT='' FAIL_ON=''
+    LOCKS=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --app) [ $# -ge 2 ] || die "--app needs a name"; APP=$2; shift 2 ;;
+            --app=*) APP=${1#--app=}; shift ;;
+            --env) [ $# -ge 2 ] || die "--env needs a name"; ENVIRONMENT=$2; shift 2 ;;
+            --env=*) ENVIRONMENT=${1#--env=}; shift ;;
+            --lock) [ $# -ge 2 ] || die "--lock needs a file"; LOCKS+=("$2"); shift 2 ;;
+            --lock=*) LOCKS+=("${1#--lock=}"); shift ;;
+            --commit) [ $# -ge 2 ] || die "--commit needs a commit"; COMMIT=$2; shift 2 ;;
+            --commit=*) COMMIT=${1#--commit=}; shift ;;
+            --fail-on) [ $# -ge 2 ] || die "--fail-on needs a severity"; FAIL_ON=$2; shift 2 ;;
+            --fail-on=*) FAIL_ON=${1#--fail-on=}; shift ;;
+            -h | --help) usage; exit 0 ;;
+            *) die "$MODE does not take $1 (see $SELF --help)" ;;
+        esac
+    done
+    [[ $APP =~ ^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$ ]] || die "--app: lower-case letters, digits and inner dashes (e.g. --app asuvaan)"
+    [[ $ENVIRONMENT =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || die "--env: lower-case letters, digits, - and _ (e.g. --env production)"
+    case $FAIL_ON in
+        '' | critical | high | medium | low) ;;
+        *) die "--fail-on: critical, high, medium or low" ;;
+    esac
+    if [ -n "$COMMIT" ]; then
+        COMMIT=$(printf '%s' "$COMMIT" | tr '[:upper:]' '[:lower:]')
+        [[ $COMMIT =~ ^[0-9a-f]{7,40}$ ]] || die "--commit: 7 to 40 hexadecimal characters"
+    fi
+    if [ "$MODE" = status ] && [ ${#LOCKS[@]} -gt 0 ]; then
+        die "status sends nothing: --lock is for push"
+    fi
+}
+
+# The lock files to send: the ones named, else the ones in this folder. Each is copied into the work folder under a
+# plain name, so no path is ever read by curl's own -F syntax.
+gather() {
+    local lock i=0 n=0 base dir manifest
+    FORM=()
+    if [ ${#LOCKS[@]} -eq 0 ]; then
+        [ ! -f composer.lock ] || LOCKS+=(composer.lock)
+        [ ! -f package-lock.json ] || LOCKS+=(package-lock.json)
+        [ ${#LOCKS[@]} -gt 0 ] || die "no composer.lock or package-lock.json here ($(pwd)): run it from the app's folder, or name them with --lock"
+    fi
+
+    for lock in "${LOCKS[@]}"; do
+        [ -f "$lock" ] || die "--lock $lock: no such file"
+        [ -r "$lock" ] || die "--lock $lock: cannot be read"
+        base=${lock##*/}
+        dir=$(dirname "$lock")
+        case $base in
+            composer.lock)
+                cp "$lock" "$WORK/composer-$i.lock"
+                FORM+=(--form "composer[$i][lock]=@$WORK/composer-$i.lock;filename=composer.lock;type=application/json")
+                FORM+=(--form-string "composer[$i][path]=$lock")
+                manifest="$dir/composer.json"
+                if [ -f "$manifest" ]; then
+                    cp "$manifest" "$WORK/composer-$i.json"
+                    FORM+=(--form "composer[$i][json]=@$WORK/composer-$i.json;filename=composer.json;type=application/json")
+                else
+                    say "note: no composer.json beside $lock - nothing in it is marked as asked for by the app"
+                fi
+                i=$((i + 1))
+                ;;
+            package-lock.json)
+                cp "$lock" "$WORK/npm-$n.json"
+                FORM+=(--form "npm[$n][lock]=@$WORK/npm-$n.json;filename=package-lock.json;type=application/json")
+                FORM+=(--form-string "npm[$n][path]=$lock")
+                n=$((n + 1))
+                ;;
+            *) die "--lock $lock: a composer.lock or a package-lock.json (yarn and pnpm are not read yet)" ;;
+        esac
+    done
+}
+
+# The commit and branch, as git says - or the CI's own variables when there is no checkout.
+facts() {
+    BRANCH=''
+    if [ -z "$COMMIT" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        COMMIT=$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)
+    fi
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        BRANCH=$(git symbolic-ref --short --quiet HEAD 2>/dev/null || true)
+    fi
+    [ -n "$COMMIT" ] || COMMIT=${GITHUB_SHA:-${CI_COMMIT_SHA:-}}
+    [ -n "$BRANCH" ] || BRANCH=${GITHUB_REF_NAME:-${CI_COMMIT_REF_NAME:-}}
+    [[ $COMMIT =~ ^[0-9a-f]{7,40}$ ]] || COMMIT=''
+}
+
+# ------------------------------------------------------------------------------------------------- what comes back
+
+# Prints what is open, and ends as --fail-on says.
+report() { # $1 the answer's file, $2 what was done ("pushed" or "")
+    local file=$1 total=0 parts='' severity count lines blocking=0
+    for severity in critical high medium low unrated; do
+        count=$(json "$severity" "$file")
+        count=${count:-0}
+        total=$((total + count))
+        [ "$count" = 0 ] || parts="$parts, $count $([ "$severity" = unrated ] && printf 'not rated' || printf '%s' "$severity")"
+    done
+
+    if [ "$2" = pushed ]; then
+        printf '%s · %s: %s packages from %s; ' "$APP" "$ENVIRONMENT" "$(json packages "$file")" "${COMMIT:0:7}${COMMIT:+, }${#LOCKS[@]} lock file$([ ${#LOCKS[@]} = 1 ] || printf s)"
+        printf '%s new, %s fixed since the last push.\n' "$(json new "$file")" "$(json fixed "$file")"
+    else
+        printf '%s · %s: last pushed %s from %s, %s packages.\n' "$APP" "$ENVIRONMENT" "$(json pushed_at "$file")" "$(json commit "$file" | cut -c1-7)" "$(json packages "$file")"
+    fi
+
+    if [ "$total" = 0 ]; then
+        printf 'Nothing open.\n'
+    else
+        printf '%s open: %s\n' "$total" "${parts#, }"
+        lines=$(json report "$file")
+        [ -z "$lines" ] || printf '%s\n' "$lines" | sed 's/^/  /'
+    fi
+    printf '%s\n' "$(json url "$file")"
+
+    case $FAIL_ON in
+        critical) [ "$(json critical "$file")" = 0 ] || blocking=1 ;;
+        high) [ $(($(json critical "$file") + $(json high "$file"))) = 0 ] || blocking=1 ;;
+        medium) [ $(($(json critical "$file") + $(json high "$file") + $(json medium "$file"))) = 0 ] || blocking=1 ;;
+        low) [ $(($(json critical "$file") + $(json high "$file") + $(json medium "$file") + $(json low "$file"))) = 0 ] || blocking=1 ;;
+    esac
+
+    if [ $blocking = 1 ]; then
+        say "a finding at $FAIL_ON or worse is open (--fail-on $FAIL_ON)"
+        exit 1
+    fi
+}
+
+push() {
+    local code
+    parse "$@"
+    settings
+    gather
+    facts
+
+    code=$(api POST /api/v1/inventories "$WORK/answer" \
+        --form-string "app=$APP" \
+        --form-string "environment=$ENVIRONMENT" \
+        ${COMMIT:+--form-string "commit=$COMMIT"} \
+        --form-string "branch=$BRANCH" \
+        --form-string "client=$SELF/$VERSION" \
+        "${FORM[@]}")
+
+    if [ "$code" != 201 ]; then
+        say "not sent: $(said "$code" "$WORK/answer")"
+        exit 3
+    fi
+    report "$WORK/answer" pushed
+}
+
+status() {
+    local code
+    parse "$@"
+    settings
+    code=$(api GET "/api/v1/apps/$APP" "$WORK/answer" --get --data-urlencode "environment=$ENVIRONMENT")
+    if [ "$code" != 200 ]; then
+        say "$(said "$code" "$WORK/answer")"
+        exit 3
+    fi
+    report "$WORK/answer" ''
+}
+
+MODE=${1:-}
+case $MODE in
+    push) shift; push "$@" ;;
+    status) shift; status "$@" ;;
+    -h | --help | help | '') usage ;;
+    -v | --version) printf '%s %s\n' "$SELF" "$VERSION" ;;
+    *) die "unknown command $MODE (see $SELF --help)" ;;
+esac
