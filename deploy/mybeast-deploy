@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+# mybeast-deploy - an app's own deploy script, run as it is and reported to MyBeast Deploys: who, from which machine,
+# the commit, the whole output as it comes, how it ended and how long it took.
+#
+#   mybeast-deploy run --app APP --env ENV [--release NAME] [--yes] [-- COMMAND [ARGS...]]
+#   mybeast-deploy rollback --app APP --env ENV [--to RELEASE] [--yes] [-- COMMAND [ARGS...]]
+#   mybeast-deploy status --app APP [--env ENV]
+#
+# Reads MYBEAST_DEPLOYS_URL (e.g. https://services.my-beast.com/deploys) and MYBEAST_DEPLOYS_KEY (sk_….…, made in the
+# project's Settings → Server keys), from the environment or from ~/.config/mybeast/deploys.env. Bash and curl,
+# nothing else; bash 3.2 (macOS) and up. The key goes to curl on its standard input, never on its command line, and
+# never to the command it runs.
+#
+# The command keeps the terminal: its prompts (a deploy password, "type production") work as they always did. Its
+# output goes to the terminal at once and, through a log file, to the service every 2 s; a batch the service did not
+# take is sent again, and nothing is kept twice. The service being down never stops a deploy: it runs, unreported or
+# reported in part, and mybeast-deploy says so. It ends with the command's own exit code.
+
+set -euo pipefail
+
+VERSION=2
+SELF=${0##*/}
+
+say() { printf '%s: %s\n' "$SELF" "$*" >&2; }
+die() {
+    say "$*"
+    exit 2
+}
+
+usage() {
+    cat <<EOF
+$SELF $VERSION - run an app's deploy script and report it to MyBeast Deploys
+
+  $SELF run --app APP --env ENV [--release NAME] [--yes] [-- COMMAND [ARGS...]]
+      Runs COMMAND (without one: the app's own deploy command from the service, after a yes) and reports it:
+      who, the commit, its output as it comes, how it ended. --release names the build when the log does not.
+
+  $SELF rollback --app APP --env ENV [--to RELEASE] [--yes] [-- COMMAND [ARGS...]]
+      The same for going back. --to RELEASE hands the command RELEASE=<release> (make rollback reads it).
+
+  $SELF status --app APP [--env ENV]
+      What is live there now, and the app's commands.
+
+Needs MYBEAST_DEPLOYS_URL and MYBEAST_DEPLOYS_KEY (a server key: the project's Settings → Server keys), exported
+or in ${CONFIG_HINT}. It ends with the command's own exit code (2 for its own refusals).
+EOF
+}
+
+CONFIG_HINT='~/.config/mybeast/deploys.env'
+WORK=
+SHIPPER=
+
+cleanup() {
+    if [ -n "$SHIPPER" ]; then kill "$SHIPPER" 2>/dev/null || true; fi
+    if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
+}
+trap cleanup EXIT
+
+# ------------------------------------------------------------------------------------------------------- settings
+
+# A KEY=VALUE file is read, never sourced; it must be readable by its owner only.
+config_value() { # $1 file, $2 name
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line#export }
+        case $line in
+            "$2"=*)
+                line=${line#"$2"=}
+                line=${line%\"}
+                line=${line#\"}
+                line=${line%\'}
+                line=${line#\'}
+                printf '%s' "$line"
+                return 0
+                ;;
+        esac
+    done <"$1"
+}
+
+settings() {
+    local file=${MYBEAST_DEPLOYS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/mybeast/deploys.env}
+
+    if { [ -z "${MYBEAST_DEPLOYS_URL:-}" ] || [ -z "${MYBEAST_DEPLOYS_KEY:-}" ]; } && [ -f "$file" ]; then
+        if [ -n "$(find "$file" -prune \( -perm -004 -o -perm -040 \) 2>/dev/null)" ]; then
+            die "$file can be read by others: chmod 600 $file"
+        fi
+        : "${MYBEAST_DEPLOYS_URL:=$(config_value "$file" MYBEAST_DEPLOYS_URL)}"
+        : "${MYBEAST_DEPLOYS_KEY:=$(config_value "$file" MYBEAST_DEPLOYS_KEY)}"
+    fi
+
+    [ -n "${MYBEAST_DEPLOYS_URL:-}" ] || die "MYBEAST_DEPLOYS_URL is not set (e.g. https://services.my-beast.com/deploys), nor in $CONFIG_HINT"
+    [ -n "${MYBEAST_DEPLOYS_KEY:-}" ] || die "MYBEAST_DEPLOYS_KEY is not set (a server key: the project's Settings → Server keys), nor in $CONFIG_HINT"
+    case $MYBEAST_DEPLOYS_URL in
+        https://* | http://localhost* | http://127.0.0.1* | http://*.localhost* | http://*.test*) ;;
+        *) die "MYBEAST_DEPLOYS_URL must be https:// (plain http only for localhost, *.localhost and *.test)" ;;
+    esac
+    [[ $MYBEAST_DEPLOYS_KEY =~ ^sk_[a-z0-9]+\.[A-Za-z0-9_-]+$ ]] || die "MYBEAST_DEPLOYS_KEY does not look like a server key (sk_….…)"
+    command -v curl >/dev/null 2>&1 || die "curl is needed"
+
+    URL=${MYBEAST_DEPLOYS_URL%/}
+    KEY=$MYBEAST_DEPLOYS_KEY
+    WORK=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/mybeast-deploy.XXXXXX")
+}
+
+# ------------------------------------------------------------------------------------------------------- the API
+
+# api METHOD PATH OUT TIMEOUT [CURL ARGS...] → the HTTP status on stdout (000: no answer); the body in OUT.
+api() {
+    local method=$1 path=$2 out=$3 timeout=$4 code
+    shift 4
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$KEY" |
+        curl --silent --show-error --proto '=https,http' --max-time "$timeout" --connect-timeout 5 --config - \
+            --header 'Accept: application/json' --request "$method" --output "$out" --write-out '%{http_code}' \
+            "$@" "$URL$path" 2>>"$WORK/curl.log") || true
+    printf '%s' "${code:-000}"
+}
+
+# json NAME FILE → a field of a flat JSON answer: a string unescaped, or a number / true / false as written; nothing
+# for null or a missing field. The service answers flat objects with plain slashes (DeployApiController::json).
+json() {
+    local body re value
+    body=$(cat "$2" 2>/dev/null) || return 0
+    re='[{,]"'"$1"'":("(([^"\\]|\\.)*)"|(-?[0-9]+|true|false))'
+    [[ $body =~ $re ]] || return 0
+    if [ -n "${BASH_REMATCH[4]}" ]; then
+        printf '%s' "${BASH_REMATCH[4]}"
+        return 0
+    fi
+    value=${BASH_REMATCH[2]}
+    value=${value//\\\\/$'\001'}
+    value=${value//\\\"/\"}
+    value=${value//\\\//\/}
+    value=${value//\\n/ }
+    value=${value//\\t/ }
+    value=${value//$'\001'/\\}
+    printf '%s' "$value"
+}
+
+# The service's word on a refusal, for the person.
+said() { # $1 code, $2 file
+    local message
+    message=$(json message "$2")
+    case $1 in
+        000) printf 'could not reach %s' "$URL" ;;
+        401) printf 'the key was refused: revoked, mistyped, or not a key of %s' "$URL" ;;
+        *) printf '%s answered %s%s' "$URL" "$1" "${message:+: $message}" ;;
+    esac
+}
+
+# --------------------------------------------------------------------------------------------- what is sent of it
+
+# A command as it is shown and sent: shell-quoted, and the value of anything that looks like a secret taken out
+# (DEPLOY_PASSWORD=… make deploy). The service masks it again.
+secretish() { # $1 a name → true when it reads like a secret's
+    local upper
+    upper=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+    case $upper in *PASSWORD* | *PASSWD* | *PASS* | *SECRET* | *TOKEN* | *KEY* | *CREDENTIAL*) return 0 ;; esac
+    return 1
+}
+
+shown_command() {
+    local arg out='' name
+    for arg in "$@"; do
+        if [[ $arg =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]] && secretish "${BASH_REMATCH[1]}"; then
+            arg="${BASH_REMATCH[1]}=…"
+            out="$out $arg"
+        elif [[ $arg =~ ^(--?[A-Za-z0-9-]+)= ]] && secretish "${BASH_REMATCH[1]}"; then
+            name=${BASH_REMATCH[1]}
+            out="$out $name=…"
+        else
+            out="$out $(printf '%q' "$arg")"
+        fi
+    done
+    printf '%s' "${out# }"
+}
+
+# What the machine says about itself: the commit and the person, as git and the system know them.
+facts() {
+    COMMIT='' BRANCH='' SUBJECT='' DIRTY=0 COMMITS=''
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        COMMIT=$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)
+        BRANCH=$(git symbolic-ref --short --quiet HEAD 2>/dev/null || true)
+        [ -z "$COMMIT" ] || SUBJECT=$(git log -1 --format=%s 2>/dev/null || true)
+        # The last commits, a line each (hash, author, subject): the service keeps the ones since what is live.
+        [ -z "$COMMIT" ] || [ "$MODE" = rollback ] || COMMITS=$(git log -n 50 --format='%H%x09%an%x09%s' 2>/dev/null || true)
+        [ -z "$(git status --porcelain 2>/dev/null | head -1)" ] || DIRTY=1
+    fi
+    ACTOR_NAME=$(git config user.name 2>/dev/null || true)
+    ACTOR_EMAIL=$(git config user.email 2>/dev/null || true)
+    OS_USER=${USER:-$(id -un 2>/dev/null || true)}
+    MACHINE=$(hostname -s 2>/dev/null || uname -n)
+}
+
+# -------------------------------------------------------------------------------------------------- the log, sent
+
+CHUNK=262144     # the most bytes one batch takes
+HOLD=65536       # an unfinished line waits for its end until it is this long (a prompt, a progress bar)
+HEARTBEAT=30     # seconds of silence before saying "still here"
+TICK=${MYBEAST_DEPLOY_TICK:-2}   # seconds between batches (the tests make it short)
+
+# ship_once [final] → 0 when the log is all with the service (or nothing could be sent and it is not final)
+ship_once() {
+    local final=${1:-0} offset size len partial code received
+    offset=$(cat "$WORK/offset")
+    size=$(wc -c <"$WORK/log" | tr -d ' ')
+
+    if [ "$size" -le "$offset" ]; then
+        if [ $(($(date +%s) - $(cat "$WORK/spoke"))) -ge $HEARTBEAT ]; then
+            code=$(api POST "/api/v1/deploys/$DEPLOY_ID/lines?offset=$offset" "$WORK/answer" 20 \
+                --header 'Content-Type: text/plain' --data-binary '')
+            [ "$code" != 200 ] || date +%s >"$WORK/spoke"
+        fi
+        return 0
+    fi
+
+    len=$((size - offset))
+    [ $len -le $CHUNK ] || len=$CHUNK
+    tail -c +$((offset + 1)) "$WORK/log" | head -c "$len" >"$WORK/chunk"
+
+    # Whole lines only while it runs: an unfinished one goes with its end (or once it grew past HOLD).
+    if [ "$final" = 0 ] && [ -n "$(tail -c 1 "$WORK/chunk")" ]; then
+        partial=$(tail -n 1 "$WORK/chunk" | wc -c | tr -d ' ')
+        if [ "$partial" -lt "$len" ]; then
+            len=$((len - partial))
+            head -c "$len" "$WORK/chunk" >"$WORK/chunk.whole" && mv "$WORK/chunk.whole" "$WORK/chunk"
+        elif [ "$len" -lt $HOLD ]; then
+            return 0
+        fi
+    fi
+
+    code=$(api POST "/api/v1/deploys/$DEPLOY_ID/lines?offset=$offset" "$WORK/answer" 20 \
+        --header 'Content-Type: text/plain' --data-binary "@$WORK/chunk")
+    received=$(json received "$WORK/answer")
+    case $code in
+        200)
+            [ -n "$received" ] || received=$((offset + len))
+            printf '%s' "$received" >"$WORK/offset"
+            date +%s >"$WORK/spoke"
+            ;;
+        409)
+            # Not where the log stands (or it has ended): from where the service says, next time.
+            received=$(json expected "$WORK/answer")
+            [ -z "$received" ] || printf '%s' "$received" >"$WORK/offset"
+            ;;
+        *)
+            printf '%s %s\n' "$code" "$(said "$code" "$WORK/answer")" >>"$WORK/ship.log"
+            return 1
+            ;;
+    esac
+}
+
+# In the background while the command runs: a batch every 2 s. Once told to stop, the rest of the log, then out.
+ship_loop() {
+    local tries=0
+    while :; do
+        if [ -e "$WORK/stop" ]; then
+            while [ "$(cat "$WORK/offset")" -lt "$(wc -c <"$WORK/log" | tr -d ' ')" ] && [ $tries -lt 5 ]; do
+                ship_once 1 || {
+                    tries=$((tries + 1))
+                    sleep 1
+                }
+            done
+            return 0
+        fi
+        ship_once 0 || true
+        sleep "$TICK"
+    done
+}
+
+# -------------------------------------------------------------------------------------------------- the commands
+
+parse() { # the options both run and rollback take → APP ENVIRONMENT RELEASE YES COMMAND_ARGS
+    APP='' ENVIRONMENT='' RELEASE_NAME='' YES=0 HAS_COMMAND=0
+    COMMAND_ARGS=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --app) [ $# -ge 2 ] || die "--app needs a name"; APP=$2; shift 2 ;;
+            --app=*) APP=${1#--app=}; shift ;;
+            --env) [ $# -ge 2 ] || die "--env needs a name"; ENVIRONMENT=$2; shift 2 ;;
+            --env=*) ENVIRONMENT=${1#--env=}; shift ;;
+            --release | --to) [ $# -ge 2 ] || die "$1 needs a release"; RELEASE_NAME=$2; shift 2 ;;
+            --release=* | --to=*) RELEASE_NAME=${1#*=}; shift ;;
+            --yes | -y) YES=1; shift ;;
+            --) shift; HAS_COMMAND=1; COMMAND_ARGS=("$@"); break ;;
+            -h | --help) usage; exit 0 ;;
+            *) die "$MODE does not take $1 (see $SELF --help)" ;;
+        esac
+    done
+    [[ $APP =~ ^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$ ]] || die "--app: lower-case letters, digits and inner dashes (e.g. --app asuvaan)"
+    if [ "$MODE" != status ] || [ -n "$ENVIRONMENT" ]; then
+        [[ $ENVIRONMENT =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || die "--env: lower-case letters, digits, - and _ (e.g. --env staging)"
+    fi
+    if [ -n "$RELEASE_NAME" ]; then
+        [[ $RELEASE_NAME =~ ^[A-Za-z0-9._+-]{1,64}$ ]] || die "a release is 1-64 letters, digits and . _ + -"
+    fi
+    if [ $HAS_COMMAND = 1 ] && [ ${#COMMAND_ARGS[@]} -eq 0 ]; then
+        die "nothing after --: give the command, or leave out -- to run the app's own"
+    fi
+}
+
+# Without a command: the app's own, from the service - shown, and run only after a yes.
+app_command() {
+    local code field command
+    field=$([ "$MODE" = rollback ] && printf rollback_command || printf deploy_command)
+    code=$(api GET "/api/v1/apps/$APP" "$WORK/app" 15 --get --data-urlencode "environment=$ENVIRONMENT")
+    [ "$code" = 200 ] || die "no command given, and the app's own could not be read: $(said "$code" "$WORK/app")"
+    command=$(json "$field" "$WORK/app")
+    [ -n "$command" ] || die "no command given, and $APP has no ${field%_command} command (its Settings page): give one after --"
+
+    say "$APP's ${field%_command} command for $ENVIRONMENT: $command"
+    if [ $YES = 0 ]; then
+        (exec </dev/tty) 2>/dev/null || die "no terminal to ask in: pass --yes to run it, or give the command after --"
+        local answer=''
+        IFS= read -r -p "$SELF: run it here, in $(pwd)? [y/N] " answer </dev/tty || answer=''
+        case $answer in y | Y | yes | YES) ;; *) die "not run" ;; esac
+    fi
+    COMMAND_ARGS=(bash -c "$command")
+    SHOWN=$command
+}
+
+register() { # → DEPLOY_ID, DEPLOY_URL, DEPLOY_TITLE (empty when the service did not take it)
+    local code kind
+    kind=$([ "$MODE" = rollback ] && printf rollback || printf deploy)
+    DEPLOY_ID='' DEPLOY_URL='' DEPLOY_TITLE=''
+    code=$(api POST /api/v1/deploys "$WORK/started" 15 \
+        --data-urlencode "app=$APP" \
+        --data-urlencode "environment=$ENVIRONMENT" \
+        --data-urlencode "kind=$kind" \
+        --data-urlencode "command=$SHOWN" \
+        ${COMMIT:+--data-urlencode "commit=$COMMIT"} \
+        --data-urlencode "commit_subject=$SUBJECT" \
+        --data-urlencode "branch=$BRANCH" \
+        ${COMMITS:+--data-urlencode "commits=$COMMITS"} \
+        --data-urlencode "dirty=$DIRTY" \
+        --data-urlencode "actor_name=$ACTOR_NAME" \
+        --data-urlencode "actor_email=$ACTOR_EMAIL" \
+        --data-urlencode "machine=$MACHINE" \
+        --data-urlencode "os_user=$OS_USER" \
+        --data-urlencode "cli_version=$VERSION" \
+        ${RELEASE_NAME:+--data-urlencode "$([ "$MODE" = rollback ] && printf rollback_to || printf release)=$RELEASE_NAME"})
+
+    if [ "$code" != 201 ]; then
+        say "not reported: $(said "$code" "$WORK/started") - the command runs all the same"
+        return 0
+    fi
+    DEPLOY_ID=$(json id "$WORK/started")
+    DEPLOY_URL=$(json url "$WORK/started")
+    DEPLOY_TITLE=$(json title "$WORK/started")
+    say "$DEPLOY_TITLE of $APP to $ENVIRONMENT: $DEPLOY_URL"
+    local warning
+    warning=$(json warning "$WORK/started")
+    [ -z "$warning" ] || say "note: $warning"
+}
+
+finish() { # $1 status slug, $2 exit code, $3 seconds
+    local code took release
+    code=$(api POST "/api/v1/deploys/$DEPLOY_ID/finish" "$WORK/finished" 20 \
+        --data-urlencode "status=$1" --data-urlencode "exit_code=$2" --data-urlencode "duration_seconds=$3" \
+        ${RELEASE_NAME:+--data-urlencode "release=$RELEASE_NAME"})
+    if [ "$code" != 200 ]; then
+        say "how it ended was not reported: $(said "$code" "$WORK/finished") - the service marks it lost in a while"
+        return 0
+    fi
+    took=$(json took "$WORK/finished")
+    release=$(json release "$WORK/finished")
+    say "$DEPLOY_TITLE $(json status "$WORK/finished") in $took${release:+, release $release}: $DEPLOY_URL"
+}
+
+run() { # run and rollback
+    parse "$@"
+    settings
+    facts
+
+    if [ $HAS_COMMAND = 1 ]; then
+        SHOWN=$(shown_command "${COMMAND_ARGS[@]}")
+    else
+        app_command
+    fi
+
+    register
+
+    : >"$WORK/log"
+    printf 0 >"$WORK/offset"
+    date +%s >"$WORK/spoke"
+    if [ -n "$DEPLOY_ID" ]; then
+        ship_loop </dev/null >/dev/null 2>>"$WORK/ship.log" &
+        SHIPPER=$!
+    fi
+
+    # The command keeps the terminal for its questions; what it prints goes to the terminal and the log at once.
+    # The tee does not die of Ctrl-C, so the command's last words (its own trap) still reach both.
+    local started status stopped=0
+    started=$(date +%s)
+    trap 'stopped=1' INT TERM HUP
+    [ "$MODE" != rollback ] || [ -z "$RELEASE_NAME" ] || export RELEASE="$RELEASE_NAME"
+    export MYBEAST_DEPLOY_ID="$DEPLOY_ID" MYBEAST_DEPLOY_PAGE="$DEPLOY_URL"
+    set +e
+    env -u MYBEAST_DEPLOYS_KEY "${COMMAND_ARGS[@]}" 2>&1 | (trap '' INT TERM HUP && exec tee -a "$WORK/log")
+    status=${PIPESTATUS[0]}
+    set -e
+    trap - INT TERM HUP
+
+    [ -n "$DEPLOY_ID" ] || exit "$status"
+
+    touch "$WORK/stop"
+    wait "$SHIPPER" 2>/dev/null || true
+    SHIPPER=
+    if [ "$(cat "$WORK/offset")" -lt "$(wc -c <"$WORK/log" | tr -d ' ')" ]; then
+        local kept="${TMPDIR:-/tmp}/mybeast-deploy-$DEPLOY_ID.log"
+        cp "$WORK/log" "$kept"
+        say "the log did not all reach the service ($(tail -1 "$WORK/ship.log" 2>/dev/null | cut -d' ' -f2-)); the whole log is kept in $kept"
+    fi
+
+    local result=failed
+    if [ "$status" = 0 ]; then
+        result=succeeded
+    elif [ "$stopped" = 1 ] || [ "$status" = 130 ]; then
+        result=cancelled
+    fi
+    finish "$result" "$status" $(($(date +%s) - started))
+    exit "$status"
+}
+
+status() {
+    local code
+    parse "$@"
+    settings
+    code=$(api GET "/api/v1/apps/$APP" "$WORK/app" 15 --get ${ENVIRONMENT:+--data-urlencode "environment=$ENVIRONMENT"})
+    [ "$code" = 200 ] || die "$(said "$code" "$WORK/app")"
+
+    printf '%s (%s)\n' "$(json name "$WORK/app")" "$APP"
+    if [ -n "$ENVIRONMENT" ]; then
+        if [ -n "$(json live_title "$WORK/app")" ]; then
+            printf '  live on %s: %s - %s, by %s, %s\n' "$ENVIRONMENT" "$(json live_release "$WORK/app")" \
+                "$(json live_title "$WORK/app")" "$(json live_by "$WORK/app")" "$(json live_at "$WORK/app")"
+        else
+            printf '  nothing live on %s yet\n' "$ENVIRONMENT"
+        fi
+        [ -z "$(json last_status "$WORK/app")" ] || printf '  last deploy there: %s\n' "$(json last_status "$WORK/app")"
+    fi
+    printf '  deploy command:   %s\n' "$(json deploy_command "$WORK/app")"
+    printf '  rollback command: %s\n' "$(json rollback_command "$WORK/app")"
+}
+
+MODE=${1:-}
+case $MODE in
+    run | rollback) shift; run "$@" ;;
+    status) shift; status "$@" ;;
+    -h | --help | help | '') usage ;;
+    -v | --version) printf '%s %s\n' "$SELF" "$VERSION" ;;
+    *) die "unknown command $MODE (see $SELF --help)" ;;
+esac
