@@ -1,6 +1,6 @@
 # mybeast-deploy
 
-Runs an app's own deploy script as it is and reports it to MyBeast Deploys (`services.my-beast.com/deploys`): who, from
+Runs an app's own deploy script as it is and reports it to My Beast Deploys (`services.my-beast.com/deploys`): who, from
 which machine, the commit, the whole output as it comes, how it ended and how long it took. Bash and curl, nothing else;
 bash 3.2 (macOS's own) and up.
 

@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 /*
- * A stand-in for MyBeast Deploys' API, for tests/run.sh: `php -S 127.0.0.1:<port> fake-service.php` with
+ * A stand-in for My Beast Deploys' API, for tests/run.sh: `php -S 127.0.0.1:<port> fake-service.php` with
  * FAKE_STATE=<folder>. It answers as routes/api.php does (flat JSON, plain slashes) and writes down what it was sent:
  * started.json (the form), log (the bytes kept, by offset), finished.json, requests (one line per call). A file in
  * the folder changes how it behaves:

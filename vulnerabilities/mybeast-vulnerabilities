@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mybeast-vulnerabilities - an app's lock files sent to MyBeast Vulnerabilities from its deploy script or CI: what it
+# mybeast-vulnerabilities - an app's lock files sent to My Beast Vulnerabilities from its deploy script or CI: what it
 # runs in an environment, matched there against the public advisories; what is open comes back.
 #
 #   mybeast-vulnerabilities push --app APP --env ENV [--lock FILE]... [--commit SHA] [--fail-on SEVERITY]
@@ -29,7 +29,7 @@ die() {
 
 usage() {
     cat <<EOF
-$SELF $VERSION - send an app's lock files to MyBeast Vulnerabilities and see what is open
+$SELF $VERSION - send an app's lock files to My Beast Vulnerabilities and see what is open
 
   $SELF push --app APP --env ENV [--lock FILE]... [--commit SHA] [--fail-on SEVERITY]
       Sends composer.lock (with the composer.json beside it) and package-lock.json - the ones in this folder, or

@@ -1,6 +1,6 @@
 # mybeast-secrets
 
-MyBeast Secrets on a machine: one environment's variables, read with a service token. Bash and curl, nothing else;
+My Beast Secrets on a machine: one environment's variables, read with a service token. Bash and curl, nothing else;
 bash 3.2 (macOS) and up.
 
 ## Settings

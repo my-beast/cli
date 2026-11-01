@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 /*
- * A stand-in for MyBeast Vulnerabilities' API, for tests/run.sh: `php -S 127.0.0.1:<port> fake-service.php` with
+ * A stand-in for My Beast Vulnerabilities' API, for tests/run.sh: `php -S 127.0.0.1:<port> fake-service.php` with
  * FAKE_STATE=<folder>. It answers as App\Vulnerabilities\Controllers\Api\InventoryController does (flat JSON but for
  * `findings`, plain slashes) and writes down what it was sent: fields.json (the form), files/<field> (each file as
  * it arrived, its name in names.json), headers.json, requests (one line per call). A file in the folder changes it:

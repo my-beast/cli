@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mybeast-deploy - an app's own deploy script, run as it is and reported to MyBeast Deploys: who, from which machine,
+# mybeast-deploy - an app's own deploy script, run as it is and reported to My Beast Deploys: who, from which machine,
 # the commit, the whole output as it comes, how it ended and how long it took.
 #
 #   mybeast-deploy run --app APP --env ENV [--release NAME] [--yes] [-- COMMAND [ARGS...]]
@@ -29,7 +29,7 @@ die() {
 
 usage() {
     cat <<EOF
-$SELF $VERSION - run an app's deploy script and report it to MyBeast Deploys
+$SELF $VERSION - run an app's deploy script and report it to My Beast Deploys
 
   $SELF run --app APP --env ENV [--release NAME] [--yes] [-- COMMAND [ARGS...]]
       Runs COMMAND (without one: the app's own deploy command from the service, after a yes) and reports it:

@@ -1,6 +1,6 @@
 # mybeast-vulnerabilities
 
-Sends an app's lock files to MyBeast Vulnerabilities (`services.my-beast.com/vulnerabilities`) from its deploy script or
+Sends an app's lock files to My Beast Vulnerabilities (`services.my-beast.com/vulnerabilities`) from its deploy script or
 CI, and prints what is open there. The service reads the files and keeps only each package's name, version, licence and
 whether it is direct or for development - never the files - and matches them against OSV's public advisories itself: the
 list of what the app runs goes nowhere else. Bash and curl, nothing else; bash 3.2 (macOS's own) and up.

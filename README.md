@@ -1,4 +1,4 @@
-# MyBeast CLI
+# My Beast CLI
 
 Three commands for the machines that build, deploy and run your apps, one bash file each. They need bash 3.2 or newer
 (macOS's own) and curl, nothing else, and never put a key on a command line, where other users' `ps` would see it.
