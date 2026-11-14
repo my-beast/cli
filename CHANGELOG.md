@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 - unreleased
+## 0.2.0 - 2026-11-14
 
 - `mybeast-deploy job` (mybeast-deploy 3): the job behind **Roll back** on the Deploys page. Cron runs it every
   minute on the app's own server, with a key of its own (`MYBEAST_DEPLOYS_JOB_KEY`, `jk_…`). It asks Deploys whether
