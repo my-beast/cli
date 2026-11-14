@@ -5,6 +5,8 @@
 #   mybeast-deploy run --app APP --env ENV [--release NAME] [--yes] [-- COMMAND [ARGS...]]
 #   mybeast-deploy rollback --app APP --env ENV [--to RELEASE] [--yes] [-- COMMAND [ARGS...]]
 #   mybeast-deploy status --app APP [--env ENV]
+#   mybeast-deploy job --app APP --env ENV (--releases-dir DIR | --releases-from 'COMMAND')
+#                      [--timeout SECONDS] [--check] -- COMMAND [ARGS...]
 #
 # Reads MYBEAST_DEPLOYS_URL (e.g. https://services.my-beast.com/deploys) and MYBEAST_DEPLOYS_KEY (sk_….…, made in the
 # project's Settings → Server keys), from the environment or from ~/.config/mybeast/deploys.env. Bash and curl,
@@ -15,10 +17,16 @@
 # output goes to the terminal at once and, through a log file, to the service every 2 s; a batch the service did not
 # take is sent again, and nothing is kept twice. The service being down never stops a deploy: it runs, unreported or
 # reported in part, and mybeast-deploy says so. It ends with the command's own exit code.
+#
+# job is for cron, every minute, on the app's own server, with a key of its own (MYBEAST_DEPLOYS_JOB_KEY, jk_….…,
+# made on the app's Settings, Rolling back). It asks Deploys whether someone asked on the page to roll back. When
+# someone did, it runs the command from its own command line, never one from the service, with RELEASE=<a release
+# this machine has just seen that it keeps>, and reports the run. There the rule is the other way round: what Deploys
+# was not told is starting does not run. What it could not report it writes down, and the next run delivers it.
 
 set -euo pipefail
 
-VERSION=2
+VERSION=3
 SELF=${0##*/}
 
 say() { printf '%s: %s\n' "$SELF" "$*" >&2; }
@@ -41,17 +49,37 @@ $SELF $VERSION - run an app's deploy script and report it to My Beast Deploys
   $SELF status --app APP [--env ENV]
       What is live there now, and the app's commands.
 
+  $SELF job --app APP --env ENV (--releases-dir DIR | --releases-from 'COMMAND')
+      [--timeout SECONDS] [--check] -- COMMAND [ARGS...]
+      For cron, every minute, on the app's own server. Asks once whether someone asked on the Deploys page to roll
+      back; then runs the command after -- with RELEASE=<a release this machine keeps> and reports it. The releases
+      it keeps are the folders of DIR, or the lines the command of --releases-from prints. --timeout stops a script
+      that hangs (1800 s unless said). --check tries the settings and the key, and runs nothing.
+
 Needs MYBEAST_DEPLOYS_URL and MYBEAST_DEPLOYS_KEY (a server key: the project's Settings → Server keys), exported
-or in ${CONFIG_HINT}. It ends with the command's own exit code (2 for its own refusals).
+or in ${CONFIG_HINT}. job needs MYBEAST_DEPLOYS_JOB_KEY in its place (a job key: the app's
+Settings, Rolling back). It ends with the command's own exit code (2 for its own refusals; job also 1 when Deploys
+could not be reached or told).
 EOF
 }
 
 CONFIG_HINT='~/.config/mybeast/deploys.env'
 WORK=
 SHIPPER=
+SHOWER=
+WATCH=
+CHILD=
+LOCK=
 
 cleanup() {
     if [ -n "$SHIPPER" ]; then kill "$SHIPPER" 2>/dev/null || true; fi
+    if [ -n "$SHOWER" ]; then kill "$SHOWER" 2>/dev/null || true; fi
+    # A command still running keeps its watch: with this run gone, the watch is what stops it.
+    if [ -n "$WATCH" ] && [ -z "$CHILD" ]; then kill "$WATCH" 2>/dev/null || true; fi
+    # The job's lock, when it is still this run's: gone in one move, so no run ever finds it half there.
+    if [ -n "$LOCK" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ]; then
+        if mv "$LOCK" "$LOCK.gone.$$" 2>/dev/null; then rm -rf "$LOCK.gone.$$"; else rm -rf "$LOCK"; fi
+    fi
     if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
@@ -79,26 +107,47 @@ config_value() { # $1 file, $2 name
 
 settings() {
     local file=${MYBEAST_DEPLOYS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/mybeast/deploys.env}
+    # Two kinds of key, each under its own name: a server key reports deploys from a laptop, a job key takes one
+    # app's rollback requests on its server. Neither does the other's work, so neither is taken for the other.
+    local name=MYBEAST_DEPLOYS_KEY key=${MYBEAST_DEPLOYS_KEY:-}
+    if [ "$MODE" = job ]; then
+        name=MYBEAST_DEPLOYS_JOB_KEY
+        key=${MYBEAST_DEPLOYS_JOB_KEY:-}
+    fi
 
-    if { [ -z "${MYBEAST_DEPLOYS_URL:-}" ] || [ -z "${MYBEAST_DEPLOYS_KEY:-}" ]; } && [ -f "$file" ]; then
+    if { [ -z "${MYBEAST_DEPLOYS_URL:-}" ] || [ -z "$key" ]; } && [ -f "$file" ]; then
         if [ -n "$(find "$file" -prune \( -perm -004 -o -perm -040 \) 2>/dev/null)" ]; then
             die "$file can be read by others: chmod 600 $file"
         fi
         : "${MYBEAST_DEPLOYS_URL:=$(config_value "$file" MYBEAST_DEPLOYS_URL)}"
-        : "${MYBEAST_DEPLOYS_KEY:=$(config_value "$file" MYBEAST_DEPLOYS_KEY)}"
+        [ -n "$key" ] || key=$(config_value "$file" "$name")
     fi
 
     [ -n "${MYBEAST_DEPLOYS_URL:-}" ] || die "MYBEAST_DEPLOYS_URL is not set (e.g. https://services.my-beast.com/deploys), nor in $CONFIG_HINT"
-    [ -n "${MYBEAST_DEPLOYS_KEY:-}" ] || die "MYBEAST_DEPLOYS_KEY is not set (a server key: the project's Settings → Server keys), nor in $CONFIG_HINT"
+    if [ "$MODE" = job ]; then
+        [ -n "$key" ] || die "MYBEAST_DEPLOYS_JOB_KEY is not set (a job key: the app's Settings, Rolling back), nor in $CONFIG_HINT"
+    else
+        [ -n "$key" ] || die "MYBEAST_DEPLOYS_KEY is not set (a server key: the project's Settings → Server keys), nor in $CONFIG_HINT"
+    fi
     case $MYBEAST_DEPLOYS_URL in
         https://* | http://localhost* | http://127.0.0.1* | http://*.localhost* | http://*.test*) ;;
         *) die "MYBEAST_DEPLOYS_URL must be https:// (plain http only for localhost, *.localhost and *.test)" ;;
     esac
-    [[ $MYBEAST_DEPLOYS_KEY =~ ^sk_[a-z0-9]+\.[A-Za-z0-9_-]+$ ]] || die "MYBEAST_DEPLOYS_KEY does not look like a server key (sk_….…)"
+    if [ "$MODE" = job ]; then
+        case $key in
+            sk_*) die "MYBEAST_DEPLOYS_JOB_KEY holds a server key (sk_…): the job needs a job key (jk_…), made on the app's Settings, Rolling back" ;;
+        esac
+        [[ $key =~ ^jk_[a-z0-9]+\.[A-Za-z0-9_-]+$ ]] || die "MYBEAST_DEPLOYS_JOB_KEY does not look like a job key (jk_….…)"
+    else
+        case $key in
+            jk_*) die "MYBEAST_DEPLOYS_KEY holds a job key (jk_…): $MODE needs a server key (sk_…), made in the project's Settings → Server keys. A job key only serves $SELF job" ;;
+        esac
+        [[ $key =~ ^sk_[a-z0-9]+\.[A-Za-z0-9_-]+$ ]] || die "MYBEAST_DEPLOYS_KEY does not look like a server key (sk_….…)"
+    fi
     command -v curl >/dev/null 2>&1 || die "curl is needed"
 
     URL=${MYBEAST_DEPLOYS_URL%/}
-    KEY=$MYBEAST_DEPLOYS_KEY
+    KEY=$key
     WORK=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/mybeast-deploy.XXXXXX")
 }
 
@@ -127,6 +176,8 @@ json() {
         return 0
     fi
     value=${BASH_REMATCH[2]}
+    # A control character has no place in a value: what the service says is printed, at a prompt and in cron's mail.
+    value=${value//[[:cntrl:]]/}
     value=${value//\\\\/$'\001'}
     value=${value//\\\"/\"}
     value=${value//\\\//\/}
@@ -187,6 +238,11 @@ facts() {
     fi
     ACTOR_NAME=$(git config user.name 2>/dev/null || true)
     ACTOR_EMAIL=$(git config user.email 2>/dev/null || true)
+    machine
+}
+
+# Where it runs and as whom, as the system knows them: all a job says of itself.
+machine() {
     OS_USER=${USER:-$(id -un 2>/dev/null || true)}
     MACHINE=$(hostname -s 2>/dev/null || uname -n)
 }
@@ -197,25 +253,28 @@ CHUNK=262144     # the most bytes one batch takes
 HOLD=65536       # an unfinished line waits for its end until it is this long (a prompt, a progress bar)
 HEARTBEAT=30     # seconds of silence before saying "still here"
 TICK=${MYBEAST_DEPLOY_TICK:-2}   # seconds between batches (the tests make it short)
+RUNS=/api/v1/deploys   # where a run's log and its end are sent: here with a server key, below /job with a job key
+KEPT=            # the folder of the log and of how far it is sent: the work folder, or a request's in the job's journal
 
 # ship_once [final] → 0 when the log is all with the service (or nothing could be sent and it is not final)
 ship_once() {
     local final=${1:-0} offset size len partial code received
-    offset=$(cat "$WORK/offset")
-    size=$(wc -c <"$WORK/log" | tr -d ' ')
+    [ ! -e "$WORK/closed" ] || return 0
+    offset=$(cat "$KEPT/offset")
+    size=$(wc -c <"$KEPT/log" | tr -d ' ')
 
     if [ "$size" -le "$offset" ]; then
-        if [ $(($(date +%s) - $(cat "$WORK/spoke"))) -ge $HEARTBEAT ]; then
-            code=$(api POST "/api/v1/deploys/$DEPLOY_ID/lines?offset=$offset" "$WORK/answer" 20 \
+        if [ $(($(date +%s) - $(cat "$KEPT/spoke"))) -ge $HEARTBEAT ]; then
+            code=$(api POST "$RUNS/$DEPLOY_ID/lines?offset=$offset" "$WORK/answer" 20 \
                 --header 'Content-Type: text/plain' --data-binary '')
-            [ "$code" != 200 ] || date +%s >"$WORK/spoke"
+            [ "$code" != 200 ] || date +%s >"$KEPT/spoke"
         fi
         return 0
     fi
 
     len=$((size - offset))
     [ $len -le $CHUNK ] || len=$CHUNK
-    tail -c +$((offset + 1)) "$WORK/log" | head -c "$len" >"$WORK/chunk"
+    tail -c +$((offset + 1)) "$KEPT/log" | head -c "$len" >"$WORK/chunk"
 
     # Whole lines only while it runs: an unfinished one goes with its end (or once it grew past HOLD).
     if [ "$final" = 0 ] && [ -n "$(tail -c 1 "$WORK/chunk")" ]; then
@@ -228,19 +287,25 @@ ship_once() {
         fi
     fi
 
-    code=$(api POST "/api/v1/deploys/$DEPLOY_ID/lines?offset=$offset" "$WORK/answer" 20 \
+    code=$(api POST "$RUNS/$DEPLOY_ID/lines?offset=$offset" "$WORK/answer" 20 \
         --header 'Content-Type: text/plain' --data-binary "@$WORK/chunk")
     received=$(json received "$WORK/answer")
     case $code in
         200)
             [ -n "$received" ] || received=$((offset + len))
-            printf '%s' "$received" >"$WORK/offset"
-            date +%s >"$WORK/spoke"
+            printf '%s' "$received" >"$KEPT/offset"
+            date +%s >"$KEPT/spoke"
             ;;
         409)
             # Not where the log stands (or it has ended): from where the service says, next time.
             received=$(json expected "$WORK/answer")
-            [ -z "$received" ] || printf '%s' "$received" >"$WORK/offset"
+            [ -z "$received" ] || printf '%s' "$received" >"$KEPT/offset"
+            # Sent from where the service stands, and still not taken: the run has ended there and its log takes
+            # nothing more. The same answer would come every time, so this log is not sent again.
+            if [ -z "$received" ] || [ "$received" = "$offset" ]; then
+                printf '%s %s\n' "$code" "$(said "$code" "$WORK/answer")" >>"$WORK/ship.log"
+                : >"$WORK/closed"
+            fi
             ;;
         *)
             printf '%s %s\n' "$code" "$(said "$code" "$WORK/answer")" >>"$WORK/ship.log"
@@ -254,7 +319,7 @@ ship_loop() {
     local tries=0
     while :; do
         if [ -e "$WORK/stop" ]; then
-            while [ "$(cat "$WORK/offset")" -lt "$(wc -c <"$WORK/log" | tr -d ' ')" ] && [ $tries -lt 5 ]; do
+            while [ "$(cat "$KEPT/offset")" -lt "$(wc -c <"$KEPT/log" | tr -d ' ')" ] && [ $tries -lt 5 ] && [ ! -e "$WORK/closed" ]; do
                 ship_once 1 || {
                     tries=$((tries + 1))
                     sleep 1
@@ -263,16 +328,27 @@ ship_loop() {
             return 0
         fi
         ship_once 0 || true
+        # The run that started this was killed outright: nobody is left to say stop.
+        kill -0 "$$" 2>/dev/null || return 0
         sleep "$TICK"
     done
 }
 
 # -------------------------------------------------------------------------------------------------- the commands
 
-parse() { # the options both run and rollback take → APP ENVIRONMENT RELEASE YES COMMAND_ARGS
+parse() { # the options both run and rollback take → APP ENVIRONMENT RELEASE YES COMMAND_ARGS; and the job's own
     APP='' ENVIRONMENT='' RELEASE_NAME='' YES=0 HAS_COMMAND=0
+    RELEASES_DIR='' RELEASES_FROM='' TIMEOUT=1800 CHECK=0
     COMMAND_ARGS=()
     while [ $# -gt 0 ]; do
+        # The job names no release and is asked nothing: Deploys names the one, and nobody is there for the other.
+        case $MODE:$1 in
+            job:--release | job:--release=* | job:--to | job:--to=* | job:--yes | job:-y) die "job does not take ${1%%=*} (see $SELF --help)" ;;
+            job:*) ;;
+            *:--releases-dir | *:--releases-dir=* | *:--releases-from | *:--releases-from=* | *:--timeout | *:--timeout=* | *:--check)
+                die "$MODE does not take ${1%%=*} (see $SELF --help)"
+                ;;
+        esac
         case $1 in
             --app) [ $# -ge 2 ] || die "--app needs a name"; APP=$2; shift 2 ;;
             --app=*) APP=${1#--app=}; shift ;;
@@ -281,6 +357,13 @@ parse() { # the options both run and rollback take → APP ENVIRONMENT RELEASE Y
             --release | --to) [ $# -ge 2 ] || die "$1 needs a release"; RELEASE_NAME=$2; shift 2 ;;
             --release=* | --to=*) RELEASE_NAME=${1#*=}; shift ;;
             --yes | -y) YES=1; shift ;;
+            --releases-dir) [ $# -ge 2 ] || die "--releases-dir needs a folder"; RELEASES_DIR=$2; shift 2 ;;
+            --releases-dir=*) RELEASES_DIR=${1#*=}; shift ;;
+            --releases-from) [ $# -ge 2 ] || die "--releases-from needs a command"; RELEASES_FROM=$2; shift 2 ;;
+            --releases-from=*) RELEASES_FROM=${1#*=}; shift ;;
+            --timeout) [ $# -ge 2 ] || die "--timeout needs seconds"; TIMEOUT=$2; shift 2 ;;
+            --timeout=*) TIMEOUT=${1#*=}; shift ;;
+            --check) CHECK=1; shift ;;
             --) shift; HAS_COMMAND=1; COMMAND_ARGS=("$@"); break ;;
             -h | --help) usage; exit 0 ;;
             *) die "$MODE does not take $1 (see $SELF --help)" ;;
@@ -292,6 +375,12 @@ parse() { # the options both run and rollback take → APP ENVIRONMENT RELEASE Y
     fi
     if [ -n "$RELEASE_NAME" ]; then
         [[ $RELEASE_NAME =~ ^[A-Za-z0-9._+-]{1,64}$ ]] || die "a release is 1-64 letters, digits and . _ + -"
+    fi
+    if [ "$MODE" = job ]; then
+        [ -n "$RELEASES_DIR" ] || [ -n "$RELEASES_FROM" ] || die "job needs --releases-dir DIR or --releases-from 'COMMAND': it only rolls back to a release it can see"
+        [ -z "$RELEASES_DIR" ] || [ -z "$RELEASES_FROM" ] || die "job takes --releases-dir or --releases-from, not both: one list of the releases it can see"
+        [ ${#COMMAND_ARGS[@]} -gt 0 ] || die "job needs its command after --: it never takes one from the service"
+        [[ $TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]] || die "--timeout: whole seconds, 1 to 999999 (e.g. --timeout 1800)"
     fi
     if [ $HAS_COMMAND = 1 ] && [ ${#COMMAND_ARGS[@]} -eq 0 ]; then
         die "nothing after --: give the command, or leave out -- to run the app's own"
@@ -352,14 +441,19 @@ register() { # → DEPLOY_ID, DEPLOY_URL, DEPLOY_TITLE (empty when the service d
     [ -z "$warning" ] || say "note: $warning"
 }
 
-finish() { # $1 status slug, $2 exit code, $3 seconds
+UNREPORTED='the service marks it lost in a while'   # what becomes of a run whose end was not taken
+
+# $1 status slug, $2 exit code, $3 seconds (a job leaves out what it does not know) → 0 when the service has it;
+# FINISHED is its answer's status
+finish() {
     local code took release
-    code=$(api POST "/api/v1/deploys/$DEPLOY_ID/finish" "$WORK/finished" 20 \
-        --data-urlencode "status=$1" --data-urlencode "exit_code=$2" --data-urlencode "duration_seconds=$3" \
+    code=$(api POST "$RUNS/$DEPLOY_ID/finish" "$WORK/finished" 20 \
+        --data-urlencode "status=$1" ${2:+--data-urlencode "exit_code=$2"} ${3:+--data-urlencode "duration_seconds=$3"} \
         ${RELEASE_NAME:+--data-urlencode "release=$RELEASE_NAME"})
+    FINISHED=$code
     if [ "$code" != 200 ]; then
-        say "how it ended was not reported: $(said "$code" "$WORK/finished") - the service marks it lost in a while"
-        return 0
+        say "how it ended was not reported: $(said "$code" "$WORK/finished") - $UNREPORTED"
+        return 1
     fi
     took=$(json took "$WORK/finished")
     release=$(json release "$WORK/finished")
@@ -379,6 +473,7 @@ run() { # run and rollback
 
     register
 
+    KEPT=$WORK
     : >"$WORK/log"
     printf 0 >"$WORK/offset"
     date +%s >"$WORK/spoke"
@@ -395,7 +490,7 @@ run() { # run and rollback
     [ "$MODE" != rollback ] || [ -z "$RELEASE_NAME" ] || export RELEASE="$RELEASE_NAME"
     export MYBEAST_DEPLOY_ID="$DEPLOY_ID" MYBEAST_DEPLOY_PAGE="$DEPLOY_URL"
     set +e
-    env -u MYBEAST_DEPLOYS_KEY "${COMMAND_ARGS[@]}" 2>&1 | (trap '' INT TERM HUP && exec tee -a "$WORK/log")
+    env -u MYBEAST_DEPLOYS_KEY -u MYBEAST_DEPLOYS_JOB_KEY "${COMMAND_ARGS[@]}" 2>&1 | (trap '' INT TERM HUP && exec tee -a "$WORK/log")
     status=${PIPESTATUS[0]}
     set -e
     trap - INT TERM HUP
@@ -417,7 +512,7 @@ run() { # run and rollback
     elif [ "$stopped" = 1 ] || [ "$status" = 130 ]; then
         result=cancelled
     fi
-    finish "$result" "$status" $(($(date +%s) - started))
+    finish "$result" "$status" $(($(date +%s) - started)) || true
     exit "$status"
 }
 
@@ -442,10 +537,743 @@ status() {
     printf '  rollback command: %s\n' "$(json rollback_command "$WORK/app")"
 }
 
+# -------------------------------------------------------------------------------------------------------- the job
+
+# Cron runs `job` every minute on the app's own server. One run asks Deploys once whether someone asked on the page
+# to roll back. When someone did, it runs the command from its own command line with RELEASE=<name>, and reports the
+# run as `rollback` reports one. Deploys is trusted with as little as can be: it names a request and a release, never
+# a command, and the release is run only when this very run has seen it among the ones the machine keeps. And what
+# Deploys was not told is starting does not run, so nothing is switched that the page cannot show.
+
+HEX='[0123456789abcdef]'
+UUID="^${HEX}{8}-${HEX}{4}-${HEX}{4}-${HEX}{4}-${HEX}{12}\$"
+# A job's name for a release: as deploys report one, with a letter or a digit first - so never "..", never an option.
+# The letters are spelled out: a range such as A-Z takes in other letters in some locales.
+ALNUM='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+RELEASE_SHAPE="^[${ALNUM}][${ALNUM}._+-]{0,63}\$"
+KEEPS=50           # the most releases it names to Deploys: the last by name
+JOURNAL=20         # the closed requests its journal keeps
+OWED_FOR=86400     # seconds a report is tried for before the job gives it up
+STOP_WITHIN=10     # seconds between telling a command to stop (TERM) and stopping it (KILL)
+LISTED_WITHIN=30   # seconds the command of --releases-from is given
+LOOKS=5            # looks, a tick apart, at a lock with no pid in it before it is taken for left behind
+
+# Its own folder, for its owner only: the lock, the journal, and when trouble was last said.
+job_folder() {
+    local is
+    STATE=${MYBEAST_DEPLOYS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/mybeast/deploy-job}/$APP-$ENVIRONMENT
+    (umask 077 && mkdir -p "$STATE/journal") 2>/dev/null || die "the job's folder could not be made: $STATE"
+    [ -O "$STATE" ] && chmod 700 "$STATE" 2>/dev/null || die "the job's folder is another user's: $STATE (MYBEAST_DEPLOYS_STATE names another place)"
+
+    # web-eu in production and web in eu-production would both come to web-eu-production: whose it is is written in it.
+    is=$(cat "$STATE/job" 2>/dev/null || true)
+    if [ -z "$is" ]; then
+        printf '%s in %s\n' "$APP" "$ENVIRONMENT" >"$STATE/job" 2>/dev/null || die "the job's folder cannot be written in: $STATE"
+    elif [ "$is" != "$APP in $ENVIRONMENT" ]; then
+        die "$STATE is the folder of the job for $is: MYBEAST_DEPLOYS_STATE names another place for this one"
+    fi
+}
+
+# The lock is a folder in the job's folder, holding the pid of the run at work. The pid goes in as a link to a file
+# written before: it is there whole or not at all, and of several runs that try at once one succeeds.
+lock_sign() { # $1 the lock → 0 when its pid is this run's now; 1 when another run's is
+    if printf '%s\n' "$$" >"$1/new.$$" 2>/dev/null; then
+        if ln "$1/new.$$" "$1/pid" 2>/dev/null; then
+            rm -f "$1/new.$$"
+            LOCK=$1
+            return 0
+        fi
+        # Another run's pid was there first (or the lock went with its run this instant). Unless this folder takes no
+        # links at all: then no run would ever get the lock, and none would say so.
+        if ln "$1/new.$$" "$1/try.$$" 2>/dev/null || [ ! -e "$1/new.$$" ]; then
+            rm -f "$1/new.$$" "$1/try.$$"
+            return 1
+        fi
+        rm -f "$1/new.$$"
+    fi
+    [ ! -d "$1" ] || die "the job's lock cannot be written: $1 (its folder must take files and hard links)"
+    return 1
+}
+
+lock_take() { # → 0 when the lock is this run's; 1 when another run is at work
+    local lock=$STATE/lock holder there looks=0
+    while :; do
+        if mkdir "$lock" 2>/dev/null; then
+            lock_sign "$lock" || return 1
+            rm -rf "$lock".gone.*
+            return 0
+        fi
+        there=1
+        holder=$(cat "$lock/pid" 2>/dev/null) || there=0
+        if [ $there = 1 ] && [[ $holder =~ ^[1-9][0-9]*$ ]]; then
+            if [ "$holder" != "$$" ] && kill -0 "$holder" 2>/dev/null; then return 1; fi
+        elif [ $looks -lt $LOOKS ]; then
+            # No pid in it: a run that takes it or leaves it this instant, and the next look tells. Or one that died
+            # right there: then every look is the same, and after the last the lock is taken for left behind.
+            looks=$((looks + 1))
+            sleep "$TICK"
+            continue
+        fi
+        # The run that held it is gone (the machine restarted, it was killed). Its pid is moved out first, and only
+        # the run that moved out that very pid goes on: two that saw the same dead pid cannot both take the lock, and
+        # a pid that turns out to be a live run's (it took the lock meanwhile) is put back.
+        if [ $there = 1 ]; then
+            mv "$lock/pid" "$lock/old.$$" 2>/dev/null || return 1
+            if [ "$(cat "$lock/old.$$" 2>/dev/null)" != "$holder" ]; then
+                ln "$lock/old.$$" "$lock/pid" 2>/dev/null || true
+                rm -f "$lock/old.$$"
+                return 1
+            fi
+            rm -f "$lock/old.$$"
+        fi
+        lock_sign "$lock" || return 1
+        return 0
+    done
+}
+
+# Trouble that would be the same every minute is said once an hour, so cron does not mail it sixty times.
+hourly() { # $1 what is wrong
+    local now last
+    now=$(date +%s)
+    last=$(cat "$STATE/said" 2>/dev/null || true)
+    if [[ $last =~ ^[0-9]+$ ]] && [ $((now - 10#$last)) -ge 0 ] && [ $((now - 10#$last)) -lt 3600 ]; then return 0; fi
+    say "$1 (said once an hour)"
+    printf '%s\n' "$now" >"$STATE/said" 2>/dev/null || true
+}
+
+# The journal: a folder per request in the job's folder, a small file for each thing done about it (taken, a start
+# left unconfirmed, the run, began, ended, closed), written whole or not at all, and the run's log until Deploys has
+# it all. What a request still needs is read from which of them are there.
+note() { # $1 the request's folder, $2 a name, $3 its value
+    printf '%s\n' "$3" >"$1/$2.new" 2>/dev/null && mv "$1/$2.new" "$1/$2" 2>/dev/null
+}
+
+noted() { # $1 the request's folder, $2 a name → its value, or nothing
+    cat "$1/$2" 2>/dev/null || true
+}
+
+# What the job itself has to say about a run goes where the script's words are: a last line of its log.
+last_line() { # $1 the request's folder, $2 the words
+    [ ! -s "$1/log" ] || [ -z "$(tail -c 1 "$1/log")" ] || printf '\n' >>"$1/log"
+    printf 'mybeast-deploy: %s\n' "$2" >>"$1/log"
+}
+
+# A request Deploys has all of: its log goes. The rest stays, for the count of the hour and so it is never run twice.
+close() { # $1 the request's folder
+    rm -f "$1/log" "$1/offset" "$1/spoke"
+    note "$1" closed "$(date +%s)" || rm -rf "$1"
+}
+
+signal_group() { # $1 a signal, $2 a command that leads its process group (or, where it could not, the command alone)
+    kill -s "$1" -- "-$2" 2>/dev/null || kill -s "$1" "$2" 2>/dev/null
+}
+
+# Beside a command while it runs. Three things end the same way: its time is up, the job is told to stop, the job
+# itself is gone (killed outright). The command's whole process group is told to stop, and stopped $STOP_WITHIN s
+# later, so nothing it started stays behind with nobody to report it. It ends with the command or soon after the job.
+watch() { # $1 the command, $2 the seconds it is given
+    local left=$2
+    # Its seconds are counted in sleeps, not read off the clock: a clock that is set meanwhile stops nothing early.
+    while [ "$left" -gt 0 ] && [ ! -e "$WORK/halt" ] && kill -0 "$$" 2>/dev/null; do
+        sleep 1
+        left=$((left - 1))
+    done
+    kill -0 -- "-$1" 2>/dev/null || kill -0 "$1" 2>/dev/null || return 0
+    if [ "$left" -le 0 ] && [ ! -e "$WORK/halt" ] && kill -0 "$$" 2>/dev/null; then : >"$WORK/late" || true; fi
+    signal_group TERM "$1" || return 0
+    left=$STOP_WITHIN
+    while [ "$left" -gt 0 ]; do
+        sleep 1
+        left=$((left - 1))
+        kill -0 -- "-$1" 2>/dev/null || kill -0 "$1" 2>/dev/null || return 0
+    done
+    signal_group KILL "$1" || true
+}
+
+# A command of this machine's own: with nothing to read, never a key, a process group of its own and a watch beside
+# it. → STATUS, its exit code; LATE is 1 when it was stopped for its time, STOPPED when the job was told to stop.
+guarded() { # $1 the seconds it is given, $2 the file its output is added to, $3 the one for its errors; then the command
+    local seconds=$1 out=$2 err=$3 code nudged child
+    shift 3
+    STATUS='' LATE=0 STOPPED=0
+    rm -f "$WORK/halt" "$WORK/late"
+    trap 'nudged=1; STOPPED=1; : >"$WORK/halt"' INT TERM HUP
+    # Monitor mode for this one start: the command leads a process group, so all it started can be stopped with it.
+    set -m 2>/dev/null || true
+    env -u MYBEAST_DEPLOYS_KEY -u MYBEAST_DEPLOYS_JOB_KEY "$@" </dev/null >>"$out" 2>>"$err" &
+    CHILD=$!
+    set +m
+    watch "$CHILD" "$seconds" </dev/null >/dev/null 2>&1 &
+    WATCH=$!
+
+    # A signal to the job ends a wait early. The command is told to stop at once (the watch, if the signal left it
+    # alive, stops it for good $STOP_WITHIN s later), and its own end is waited for.
+    while :; do
+        nudged=0 code=0
+        wait "$CHILD" 2>/dev/null || code=$?
+        if [ $code = 127 ] && [ -n "$STATUS" ]; then break; fi
+        STATUS=$code
+        [ $nudged = 1 ] || break
+        signal_group TERM "$CHILD" || true
+    done
+    trap - INT TERM HUP
+    child=$CHILD CHILD=''
+    [ ! -e "$WORK/late" ] || LATE=1
+    # Told to stop, and its leader gone: what is left of its group is stopped at once.
+    if [ $LATE = 1 ] || [ $STOPPED = 1 ]; then signal_group KILL "$child" || true; fi
+    kill "$WATCH" 2>/dev/null || true
+    wait "$WATCH" 2>/dev/null || true
+    WATCH=''
+}
+
+# The releases this machine keeps, as it sees them now: the folders of --releases-dir, or the lines the command of
+# --releases-from prints. Only names of a job's shape count, and of those the last $KEEPS by name. → RELEASES (the
+# last name first), FOUND (how many there were) and LISTED (where, in words); 1 with WHY when they cannot be read.
+releases() {
+    local entry name names='' sorted
+    RELEASES=() FOUND=0 WHY=''
+    if [ -n "$RELEASES_DIR" ]; then
+        LISTED="in $RELEASES_DIR"
+        if [ ! -d "$RELEASES_DIR" ]; then
+            WHY="$RELEASES_DIR is not a folder on this machine"
+            return 1
+        fi
+        for entry in "$RELEASES_DIR"/*/; do
+            [ -d "$entry" ] || continue
+            name=${entry%/}
+            name=${name##*/}
+            [[ $name =~ $RELEASE_SHAPE ]] || continue
+            names="$names$name"$'\n'
+        done
+    else
+        LISTED="among what '$RELEASES_FROM' lists"
+        : >"$WORK/listed"
+        : >"$WORK/listed.err"
+        guarded $LISTED_WITHIN "$WORK/listed" "$WORK/listed.err" bash -c "$RELEASES_FROM"
+        # Told to stop while it listed them: the job stops, and has nothing to say.
+        [ $STOPPED = 0 ] || exit 130
+        if [ $LATE = 1 ]; then
+            WHY="'$RELEASES_FROM' did not end in $LISTED_WITHIN s"
+        elif [ "$STATUS" != 0 ]; then
+            WHY="'$RELEASES_FROM' ended with $STATUS"
+            name=$(head -n 1 "$WORK/listed.err" 2>/dev/null || true)
+            [ -z "$name" ] || WHY="$WHY: ${name:0:200}"
+        fi
+        [ -z "$WHY" ] || return 1
+        while IFS= read -r name || [ -n "$name" ]; do
+            [[ $name =~ $RELEASE_SHAPE ]] || continue
+            names="$names$name"$'\n'
+        done <"$WORK/listed"
+    fi
+    [ -n "$names" ] || return 0
+    sorted=$(printf '%s' "$names" | LC_ALL=C sort -ru)
+    while IFS= read -r name; do
+        FOUND=$((FOUND + 1))
+        [ $FOUND -gt $KEEPS ] || RELEASES+=("$name")
+    done <<<"$sorted"
+}
+
+keeps() { # $1 a name → true when this run has just seen it among the releases the machine keeps
+    local name
+    for name in ${RELEASES[@]+"${RELEASES[@]}"}; do
+        [ "$name" != "$1" ] || return 0
+    done
+    return 1
+}
+
+# The word of its command line that names the program: the first after any NAME=value, which env takes as settings.
+program() {
+    local word
+    for word in "${COMMAND_ARGS[@]}"; do
+        [[ $word =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || {
+            printf '%s' "$word"
+            return 0
+        }
+    done
+}
+
+# The one call of a run: who this is and what it keeps. Back comes what the key is for, and a request or none.
+ask() { # $1 "check" for a check, which takes nothing → the HTTP status; the answer in $WORK/asked
+    local list
+    list=$(printf '%s\n' ${RELEASES[@]+"${RELEASES[@]}"})
+    api POST /api/v1/job/ask "$WORK/asked" 15 \
+        --data-urlencode "machine=${MACHINE:0:120}" --data-urlencode "os_user=${OS_USER:0:64}" \
+        --data-urlencode "cli_version=$VERSION" --data-urlencode "releases=$list" ${1:+--data-urlencode "check=1"}
+}
+
+# The answer says what the key is for: this app in this environment, or the job stops before anything else.
+for_this_job() { # → 1 with WHY when it is for something else
+    local app environment
+    app=$(json app "$WORK/asked")
+    environment=$(json environment "$WORK/asked")
+    if [ -z "$app" ] || [ -z "$environment" ]; then
+        WHY="$URL did not say what this key is for: is MYBEAST_DEPLOYS_URL the address of Deploys?"
+        return 1
+    fi
+    [ "$app" != "$APP" ] || [ "$environment" != "$ENVIRONMENT" ] || return 0
+    WHY="this key is for ${app:0:40} in ${environment:0:32}, not $APP in $ENVIRONMENT: check --app and --env, or the key"
+    return 1
+}
+
+# --check: the settings, what the key is for, the releases found, the command, and one call that says who this
+# machine is. It takes nothing, and Deploys does not count it as the job asking.
+check() {
+    local code name names='' shown=0 project of_key of_releases of_command of_page wrong=0
+    printf '%s: checking the job for %s in %s. Nothing will be run.\n' "$SELF" "$APP" "$ENVIRONMENT"
+
+    if ! releases; then
+        of_releases="not read: $WHY"
+        wrong=1
+    elif [ $FOUND = 0 ]; then
+        of_releases="none $LISTED: the job only rolls back to a release it can see"
+        wrong=1
+    else
+        for name in "${RELEASES[@]}"; do
+            shown=$((shown + 1))
+            [ $shown -gt 10 ] || names="$names $name"
+        done
+        [ ${#RELEASES[@]} -le 10 ] || names="$names and $((${#RELEASES[@]} - 10)) more"
+        of_releases="$FOUND $LISTED:$names"
+        [ $FOUND -le $KEEPS ] || of_releases="$KEEPS of $FOUND $LISTED, the last by name:$names"
+    fi
+
+    of_page='not known: Deploys did not say'
+    code=$(ask check)
+    if [ "$code" = 401 ]; then
+        of_key=$(said "$code" "$WORK/asked")
+        wrong=1
+    elif [ "$code" != 200 ]; then
+        of_key="not checked: $(said "$code" "$WORK/asked")"
+        wrong=1
+    elif ! for_this_job; then
+        of_key=$WHY
+        wrong=1
+    else
+        project=$(json project "$WORK/asked")
+        of_key="ok: it is for $APP in $ENVIRONMENT${project:+ (${project:0:80})}"
+        of_page=$(json page "$WORK/asked")
+        if [ "$(json on "$WORK/asked")" = true ]; then
+            of_page="on: ${of_page:0:500}"
+        else
+            of_page="off: an admin switches it on at ${of_page:0:500}"
+        fi
+    fi
+
+    of_command="$SHOWN (it gets RELEASE=<one of the releases>)"
+    if ! command -v -- "$(program)" >/dev/null 2>&1; then
+        of_command="not found on this machine: $(program)"
+        wrong=1
+    fi
+
+    printf '  %-11s%s\n' key "$of_key" releases "$of_releases" command "$of_command" 'the page' "$of_page"
+    if [ $wrong = 1 ]; then
+        printf '%s: not ready: put right what is said above.\n' "$SELF"
+        exit 2
+    fi
+    printf '%s: Deploys heard this machine as %s.\n' "$SELF" "$MACHINE"
+    exit 0
+}
+
+# An answer that is not the one hoped for: is it for good? A refusal of that one call is (4xx). The key or the plan
+# refused, too many calls, the service's own trouble, no answer at all: those may be different a minute on.
+final() { # $1 an HTTP status
+    case $1 in
+        401 | 402 | 408 | 429) return 1 ;;
+        4??) return 0 ;;
+    esac
+    return 1
+}
+
+# The job will not run a request, and tells Deploys why: the page says it to the people who asked.
+refuse() { # $1 why, for Deploys (one line, 200 characters at most); $2 the same for who reads this machine's words
+    local code
+    code=$(api POST "/api/v1/job/requests/$REQUEST/refuse" "$WORK/told" 15 --data-urlencode "why=${1:0:200}")
+    if [ "$code" = 200 ]; then
+        say "not run: $2. Deploys was told."
+        exit 0
+    fi
+    say "not run: $2. Deploys could not be told ($(said "$code" "$WORK/told"))."
+    exit 1
+}
+
+start_call() { # one start of $REQUEST → the HTTP status; the answer in $WORK/started
+    api POST "/api/v1/job/requests/$REQUEST/start" "$WORK/started" 15 \
+        --data-urlencode "command=${SHOWN:0:4000}" --data-urlencode "machine=${MACHINE:0:120}" \
+        --data-urlencode "os_user=${OS_USER:0:64}" --data-urlencode "cli_version=$VERSION"
+}
+
+started() { # the answer to a start → DEPLOY_ID, DEPLOY_TITLE, DEPLOY_URL; 1 when it names no run
+    DEPLOY_ID=$(json id "$WORK/started")
+    DEPLOY_TITLE=$(json title "$WORK/started")
+    DEPLOY_URL=$(json url "$WORK/started")
+    DEPLOY_TITLE=${DEPLOY_TITLE:0:80}
+    DEPLOY_URL=${DEPLOY_URL:0:500}
+    [ -n "$DEPLOY_TITLE" ] || DEPLOY_TITLE='The rollback'
+    [[ $DEPLOY_ID =~ $UUID ]]
+}
+
+# The log as it grows, to the terminal: someone at the prompt reads the script as it runs, cron's mail has it whole.
+show_loop() {
+    local shown=0 size last=0
+    while :; do
+        [ ! -e "$WORK/stop" ] || last=1
+        size=$(wc -c <"$KEPT/log" | tr -d ' ')
+        if [ "$size" -gt "$shown" ]; then
+            tail -c +$((shown + 1)) "$KEPT/log" | head -c $((size - shown)) || true
+            shown=$size
+        fi
+        [ $last = 0 ] || return 0
+        kill -0 "$$" 2>/dev/null || return 0
+        sleep "$TICK"
+    done
+}
+
+# What Deploys has not got of a log, batch after batch. → 0 when it has it all, or will never take the rest; 1 when
+# it could not take it now (TROUBLE says why).
+ship_rest() {
+    local before code
+    while [ ! -e "$WORK/closed" ]; do
+        before=$(cat "$KEPT/offset")
+        [ "$before" -lt "$(wc -c <"$KEPT/log" | tr -d ' ')" ] || return 0
+        if ship_once 1; then
+            if [ ! -e "$WORK/closed" ] && [ "$(cat "$KEPT/offset")" = "$before" ]; then
+                TROUBLE="$URL took a batch of the log and stayed where it was"
+                return 1
+            fi
+            continue
+        fi
+        code=$(tail -n 1 "$WORK/ship.log" 2>/dev/null | cut -d' ' -f1)
+        # Refused for good (the run is no longer this key's): the rest is never taken. Its end is still told.
+        ! final "$code" || return 0
+        TROUBLE=$(tail -n 1 "$WORK/ship.log" 2>/dev/null | cut -d' ' -f2-)
+        return 1
+    done
+}
+
+# A run that has ended, to Deploys: what it has not got of the log, then how it ended. The log goes first: once a
+# run has its end there, its log takes nothing more. → 0 when the request is closed; 1 when it has to wait (TROUBLE).
+report() { # $1 the request's folder; $2 "late" when a run before this one ended it. DEPLOY_* and KEPT are its
+    local entry=$1 late=${2:-} status='' code='' seconds='' how
+    read -r status code seconds <"$entry/ended" 2>/dev/null || true
+    case $status in
+        succeeded | failed | cancelled) ;;
+        *) status=failed code='' seconds='' ;;
+    esac
+    [[ $code =~ ^[0-9]{1,3}$ ]] || code=''
+    [[ $seconds =~ ^[0-9]{1,6}$ ]] && [ "$seconds" -le 604800 ] || seconds=''
+    [[ $(noted "$entry" offset) =~ ^[0-9]+$ ]] || printf 0 >"$entry/offset"
+    [ -e "$entry/log" ] || : >"$entry/log"
+    [ -e "$entry/spoke" ] || date +%s >"$entry/spoke"
+
+    if ! ship_rest; then
+        [ -n "$late" ] || say "the log did not all reach Deploys ($TROUBLE): the next run of the job sends the rest, and how it ended"
+        return 1
+    fi
+
+    # What finish says is held back: which of its words are true depends on the answer.
+    finish "$status" "$code" "$seconds" 2>"$WORK/said" || true
+    if final "$FINISHED"; then
+        # Deploys will never take this end (the run is no longer this key's): nothing is owed that can be paid.
+        say "Deploys did not take how $DEPLOY_TITLE ended ($(said "$FINISHED" "$WORK/finished")). The job does not try again."
+        close "$entry"
+        return 0
+    elif [ "$FINISHED" != 200 ]; then
+        TROUBLE=$(said "$FINISHED" "$WORK/finished")
+        [ -n "$late" ] || cat "$WORK/said" >&2
+        return 1
+    fi
+
+    how=$(noted "$entry" how)
+    close "$entry"
+    if [ "$how" = cut ]; then
+        say "$DEPLOY_TITLE was cut short: this machine restarted, or the job was stopped. Deploys was told it failed."
+    elif [ "$how" = never ]; then
+        say "$DEPLOY_TITLE was not run. Nothing changed, and Deploys was told."
+    else
+        cat "$WORK/said" >&2
+    fi
+}
+
+# One request the journal still owes for. A start nobody confirmed is asked about again; a run that began and never
+# ended was cut short; a run that ended is reported. → 0 when nothing is owed for it any more; 1 when it has to wait.
+settle() { # $1 the request's folder
+    local entry=$1 code taken now
+    REQUEST=${entry##*/}
+    # Not a request's folder: nothing the job made.
+    if ! [[ $REQUEST =~ $UUID ]]; then
+        rm -rf "$entry"
+        return 0
+    fi
+    KEPT=$entry
+    DEPLOY_ID=$(noted "$entry" run)
+    DEPLOY_TITLE=$(noted "$entry" title)
+    DEPLOY_URL=$(noted "$entry" url)
+    [ -n "$DEPLOY_TITLE" ] || DEPLOY_TITLE='A rollback asked for from the page'
+    rm -f "$WORK/closed"
+
+    now=$(date +%s)
+    taken=$(noted "$entry" taken)
+    if ! [[ $taken =~ ^[0-9]+$ ]]; then
+        taken=$now
+        note "$entry" taken "$now" || true
+    fi
+    if [ $((now - 10#$taken)) -gt $OWED_FOR ]; then
+        say "$DEPLOY_TITLE: Deploys could not be told how it went for a day. The job does not try again."
+        close "$entry"
+        return 0
+    fi
+
+    if ! [[ $DEPLOY_ID =~ $UUID ]]; then
+        # A start nobody confirmed is asked about again. With the run Deploys names, the job only says the script was
+        # not run: what it did not run then, it never runs late.
+        code=$(start_call)
+        if final "$code"; then
+            # 409: it went back to waiting, or it ended. Deploys has no run of it to be told about.
+            rm -rf "$entry"
+            return 0
+        elif [ "$code" != 200 ] && [ "$code" != 201 ]; then
+            TROUBLE=$(said "$code" "$WORK/started")
+            return 1
+        elif ! started; then
+            rm -rf "$entry"
+            return 0
+        fi
+        [ -s "$entry/log" ] || printf '%s\n' 'mybeast-deploy: Deploys did not confirm the start in time, so the script was not run. Nothing changed.' >"$entry/log"
+        note "$entry" title "$DEPLOY_TITLE" && note "$entry" url "$DEPLOY_URL" && note "$entry" run "$DEPLOY_ID" || {
+            TROUBLE="the job could not write in its journal ($entry)"
+            return 1
+        }
+    fi
+
+    if [ ! -e "$entry/ended" ]; then
+        if [ -e "$entry/began" ]; then
+            last_line "$entry" 'the job was cut short here: this machine restarted, or the job was stopped. How the script ended is not known.'
+            note "$entry" how cut
+            note "$entry" ended 'failed - -'
+        else
+            [ -s "$entry/log" ] || printf '%s\n' 'mybeast-deploy: the job stopped before the script began, so it was not run. Nothing changed.' >"$entry/log"
+            note "$entry" how never
+            note "$entry" ended 'cancelled - 0'
+        fi
+    fi
+
+    report "$entry" late
+}
+
+# What the journal still owes Deploys is delivered before anything new is asked for. → 1 when something stays owed
+# (TROUBLE says why): the run ends there, and the next one tries again.
+owed() {
+    local entry line keep=$JOURNAL count=0
+    for entry in "$STATE/journal"/*/; do
+        [ -d "$entry" ] || continue
+        entry=${entry%/}
+        [ ! -e "$entry/closed" ] || continue
+        settle "$entry" || return 1
+    done
+
+    # The last $JOURNAL closed requests stay (more when more may run in an hour: the count needs them); older ones go.
+    [ "$PER_HOUR" -le "$keep" ] || keep=$PER_HOUR
+    for entry in "$STATE/journal"/*/; do
+        [ -e "${entry}closed" ] || continue
+        printf '%s %s\n' "$(noted "${entry%/}" closed)" "${entry%/}"
+    done | LC_ALL=C sort -rn | while IFS= read -r line; do
+        count=$((count + 1))
+        [ $count -le "$keep" ] || rm -rf "${line#* }"
+    done
+    return 0
+}
+
+began_lately() { # → how many runs began here in the last hour, by the journal
+    local entry began now count=0
+    now=$(date +%s)
+    for entry in "$STATE/journal"/*/; do
+        began=$(noted "${entry%/}" began)
+        [[ $began =~ ^[0-9]+$ ]] || continue
+        [ $((now - 10#$began)) -ge 3600 ] || count=$((count + 1))
+    done
+    printf '%s' "$count"
+}
+
+job() {
+    local code by drill why='' here='' most try=0 began seconds result status warning
+    TROUBLE=''
+    parse "$@"
+    PER_HOUR=${MYBEAST_DEPLOY_JOB_MAX_PER_HOUR:-6}
+    [[ $PER_HOUR =~ ^[0-9]{1,4}$ ]] || die "MYBEAST_DEPLOY_JOB_MAX_PER_HOUR is the most rollbacks the job runs in an hour: a number (6 unless said)"
+    settings
+    machine
+    RUNS=/api/v1/job/deploys
+    UNREPORTED='the next run of the job reports it'
+    SHOWN=$(shown_command "${COMMAND_ARGS[@]}")
+    job_folder
+
+    [ $CHECK = 0 ] || check
+
+    # 1. One run at a time. Another is at work: this one leaves, and says nothing.
+    lock_take || exit 0
+
+    # 2. What the journal still owes, before anything new.
+    owed || {
+        hourly "$TROUBLE"
+        exit 1
+    }
+
+    # 3. The releases this machine keeps, as it sees them now.
+    releases || {
+        hourly "the releases could not be read: $WHY"
+        exit 2
+    }
+
+    # 4. The one call. The answer must be for this app in this environment, or the key is for something else.
+    code=$(ask)
+    if [ "$code" != 200 ]; then
+        hourly "$(said "$code" "$WORK/asked")"
+        exit 1
+    fi
+    for_this_job || die "$WHY"
+
+    # 5. Nothing waits: cron's log stays empty.
+    REQUEST=$(json request "$WORK/asked")
+    [ -n "$REQUEST" ] || exit 0
+
+    WANTED=$(json release "$WORK/asked")
+    by=$(json asked_by "$WORK/asked")
+    by=${by:0:80}
+    drill=$(json test "$WORK/asked")
+
+    # 7. What is asked must be what this machine can do. The id goes into addresses and names a folder of the
+    # journal: a uuid, or nothing is done with it - not even a refusal, which would carry it in its address.
+    if ! [[ $REQUEST =~ $UUID ]]; then
+        say "not run: Deploys named a request whose id is not a uuid, so nothing can be told about it either. Nothing changed."
+        exit 1
+    fi
+    if ! [[ $WANTED =~ $RELEASE_SHAPE ]]; then
+        here="Deploys named a release the job does not take (\"${WANTED:0:64}\"): a name is letters, digits and . _ + -, and starts with a letter or a digit"
+        why="the release's name is not one the job takes: letters, digits and . _ + -, starting with a letter or a digit"
+    elif ! keeps "$WANTED"; then
+        here="$WANTED is not $LISTED any more"
+        why="$WANTED is not kept on this server any more"
+    elif [ -e "$STATE/journal/$REQUEST" ]; then
+        here='the job closed this request before, and does not run one twice'
+        why='the job closed this request before: it does not run one twice'
+    elif ! command -v -- "$(program)" >/dev/null 2>&1; then
+        here="the job's own command was not found on this machine: $(program)"
+        why="the job's own command was not found on this server"
+    elif [ "$drill" != true ] && [ "$(began_lately)" -ge "$PER_HOUR" ]; then
+        most="$PER_HOUR rollbacks"
+        [ "$PER_HOUR" != 1 ] || most='1 rollback'
+        here="$most began here in the last hour, the most the job runs"
+        why="$most ran here in the last hour, the most the job runs"
+    fi
+    [ -z "$why" ] || refuse "$why" "$here"
+
+    # 6. A test from the page: what it would run, said here and to Deploys. Nothing is run.
+    if [ "$drill" = true ]; then
+        say "took a test from the page. It would run: RELEASE=$WANTED $SHOWN. Nothing was run."
+        code=$(api POST "/api/v1/job/requests/$REQUEST/tested" "$WORK/told" 15 --data-urlencode "command=${SHOWN:0:1000}")
+        [ "$code" = 200 ] || {
+            say "Deploys could not be told of the test ($(said "$code" "$WORK/told"))"
+            exit 1
+        }
+        exit 0
+    fi
+
+    if [ -n "$by" ]; then
+        say "took $by's request: roll back $APP in $ENVIRONMENT to $WANTED"
+    else
+        say "took a request: roll back $APP in $ENVIRONMENT to $WANTED"
+    fi
+
+    # 8. No report, no run. The request is in the journal before Deploys is told, so a start whose answer never
+    # comes is known to the next run; and the command starts only on Deploys' own word that the run is on its page.
+    ENTRY=$STATE/journal/$REQUEST
+    mkdir "$ENTRY" 2>/dev/null && note "$ENTRY" taken "$(date +%s)" && note "$ENTRY" release "$WANTED" || {
+        say "not run: the job could not write in its journal ($ENTRY). Nothing changed."
+        exit 1
+    }
+    while :; do
+        try=$((try + 1))
+        code=$(start_call)
+        if [ "$code" = 200 ] || [ "$code" = 201 ]; then
+            break
+        elif [ "$code" = 409 ]; then
+            rm -rf "$ENTRY"
+            say "not run: the request is no longer this job's to start ($(said "$code" "$WORK/started")). Nothing changed."
+            exit 0
+        elif final "$code"; then
+            rm -rf "$ENTRY"
+            say "not run: Deploys did not take the start ($(said "$code" "$WORK/started")). Nothing changed."
+            exit 1
+        elif [ $try -ge 3 ]; then
+            # It may have arrived all the same. The journal says the start was not confirmed: the next run asks
+            # about it, and whatever the answer, the script is not run then.
+            note "$ENTRY" unconfirmed "$(date +%s)" || true
+            say "not run: Deploys did not confirm the start ($(said "$code" "$WORK/started")). Nothing changed."
+            exit 1
+        fi
+        sleep "$TICK"
+    done
+    if ! started; then
+        rm -rf "$ENTRY"
+        say "not run: Deploys' answer to the start named no run. Nothing changed."
+        exit 1
+    fi
+    : >"$ENTRY/log" && printf 0 >"$ENTRY/offset" && date +%s >"$ENTRY/spoke" &&
+        note "$ENTRY" title "$DEPLOY_TITLE" && note "$ENTRY" url "$DEPLOY_URL" && note "$ENTRY" run "$DEPLOY_ID" || {
+        say "not run: the job could not write in its journal ($ENTRY). Nothing changed."
+        exit 1
+    }
+    say "$DEPLOY_TITLE of $APP in $ENVIRONMENT: $DEPLOY_URL"
+    warning=$(json warning "$WORK/started")
+    [ -z "$warning" ] || say "note: $warning"
+
+    # 9. The command: its output into the journal's log, from there to Deploys every 2 s and to the terminal. The
+    # log is a file, not a pipe: whatever becomes of cron's own pipe, the script goes on writing.
+    KEPT=$ENTRY
+    rm -f "$WORK/stop" "$WORK/closed"
+    ship_loop </dev/null >/dev/null 2>>"$WORK/ship.log" &
+    SHIPPER=$!
+    show_loop </dev/null 2>/dev/null &
+    SHOWER=$!
+    began=$(date +%s)
+    note "$ENTRY" began "$began" || {
+        say "not run: the job could not write in its journal ($ENTRY). Nothing changed."
+        exit 1
+    }
+    guarded "$TIMEOUT" "$ENTRY/log" "$ENTRY/log" RELEASE="$WANTED" MYBEAST_DEPLOY_ID="$DEPLOY_ID" \
+        MYBEAST_DEPLOY_PAGE="$DEPLOY_URL" MYBEAST_ROLLBACK_REQUEST="$REQUEST" "${COMMAND_ARGS[@]}"
+
+    status=$STATUS
+    [[ $status =~ ^[0-9]+$ ]] || status=1
+    seconds=$(($(date +%s) - began))
+    result=failed
+    if [ $LATE = 1 ]; then
+        [ "$status" != 0 ] || status=124
+        last_line "$ENTRY" "stopped after $TIMEOUT s (--timeout): the script was still running." || true
+    elif [ "$status" = 0 ]; then
+        result=succeeded
+    elif [ $STOPPED = 1 ] || [ "$status" = 130 ]; then
+        result=cancelled
+        [ $STOPPED = 0 ] || last_line "$ENTRY" 'the job was told to stop, and stopped the script.' || true
+    fi
+    note "$ENTRY" ended "$result $status $seconds" || true
+
+    touch "$WORK/stop" || true
+    wait "$SHIPPER" 2>/dev/null || true
+    SHIPPER=
+    wait "$SHOWER" 2>/dev/null || true
+    SHOWER=
+
+    # 10. How it ended. What Deploys does not take now stays in the journal for the next run.
+    report "$ENTRY" || true
+    exit "$status"
+}
+
 MODE=${1:-}
 case $MODE in
     run | rollback) shift; run "$@" ;;
     status) shift; status "$@" ;;
+    job) shift; job "$@" ;;
     -h | --help | help | '') usage ;;
     -v | --version) printf '%s %s\n' "$SELF" "$VERSION" ;;
     *) die "unknown command $MODE (see $SELF --help)" ;;

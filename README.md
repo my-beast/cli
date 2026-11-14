@@ -5,7 +5,7 @@ Three commands for the machines that build, deploy and run your apps, one bash f
 
 | Command | Product | Does |
 |---|---|---|
-| [`mybeast-deploy`](deploy/README.md) | [Deploys](https://services.my-beast.com/deploys) | Runs your own deploy or rollback script as it is, and reports it: who shipped what, the log, the outcome |
+| [`mybeast-deploy`](deploy/README.md) | [Deploys](https://services.my-beast.com/deploys) | Runs your own deploy or rollback script as it is, and reports it: who shipped what, the log, the outcome. On your server, as a job: rolls back when someone asks on the Deploys page |
 | [`mybeast-secrets`](secrets/README.md) | [Secrets](https://services.my-beast.com/secrets) | Writes one environment's variables to a `.env`, or runs a command with them and writes nothing |
 | [`mybeast-vulnerabilities`](vulnerabilities/README.md) | [Vulnerabilities](https://services.my-beast.com/vulnerabilities) | Pushes the packages an app runs (its lock files), and fails CI while a hole that bad is open |
 
