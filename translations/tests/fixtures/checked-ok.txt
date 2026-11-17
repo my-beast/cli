@@ -1,0 +1,4 @@
+ok
+3 strings checked
+Finnish (fi): whole and sound
+Swedish (sv): whole and sound

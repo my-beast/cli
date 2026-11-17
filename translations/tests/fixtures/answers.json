@@ -1,0 +1,51 @@
+{
+    "pushed": {
+        "id": "0b7d6a1c-6f0e-4a0b-9d6e-2f8a5c3e1b47",
+        "check": false,
+        "files": [
+            {"file": "resources/js/locales/{lang}.json", "format": "i18next", "strings": 3, "added": 1, "changed": 1, "restored": 0, "archived": 0, "not_in_push": 0}
+        ],
+        "languages": [
+            {"language": "fi", "added": false, "taken": 1, "proposals": 1, "missing": 0, "needs_person": 0},
+            {"language": "sv", "added": true, "taken": 0, "proposals": 0, "missing": 2, "needs_person": 0}
+        ],
+        "fill": {"id": 7, "state": "queued", "total": 2, "done": 0, "held": 0, "message": null}
+    },
+    "checked-ok": {
+        "check": true,
+        "ok": true,
+        "strings": 3,
+        "missing": {"fi": 0, "sv": 0},
+        "failed": {"fi": 0, "sv": 0},
+        "problems": [],
+        "more": false
+    },
+    "checked-failed": {
+        "check": true,
+        "ok": false,
+        "strings": 3,
+        "missing": {"fi": 1, "sv": 0},
+        "failed": {"fi": 1, "sv": 0},
+        "problems": [
+            {"file": "resources/js/locales/{lang}.json", "language": "fi", "key": "common.hello", "problem": "placeholders", "detail": "missing {{name}}; extra {{nimi}}"},
+            {"file": "resources/js/locales/{lang}.json", "language": "fi", "key": "money.title", "problem": "missing", "detail": "No words for it."}
+        ],
+        "more": false
+    },
+    "files": [
+        {"file": "resources/js/locales/{lang}.json", "format": "i18next", "nested": false, "strings": 3, "languages": ["fi", "sv"], "pushed_at": "2026-11-17T09:00:00Z", "pulled_at": null}
+    ],
+    "standing": {
+        "source": "en",
+        "strings": 3,
+        "languages": [
+            {"language": "fi", "mode": "use-at-once", "missing": 0, "machine": 2, "reviewed": 1, "outdated": 0, "needs_person": 0},
+            {"language": "sv", "mode": "after-review", "missing": 1, "machine": 2, "reviewed": 0, "outdated": 0, "needs_person": 0}
+        ],
+        "fill": {"id": 7, "state": "running", "total": 2, "done": 1, "held": 0, "message": null},
+        "filling": true
+    },
+    "fill-running": {"id": 7, "state": "running", "total": 2, "done": 1, "held": 0, "message": null},
+    "fill-done": {"id": 7, "state": "done", "total": 2, "done": 2, "held": 0, "message": null},
+    "fill-waiting": {"id": 7, "state": "waiting", "total": 2, "done": 1, "held": 0, "message": "The Starter package has room for 2,000,000 characters a month, and they are used up."}
+}

@@ -31,7 +31,7 @@ jobs:
       - name: The files and their sums
         run: |
           mkdir dist
-          cp deploy/mybeast-deploy secrets/mybeast-secrets vulnerabilities/mybeast-vulnerabilities dist/
+          cp deploy/mybeast-deploy secrets/mybeast-secrets translations/mybeast-translations vulnerabilities/mybeast-vulnerabilities dist/
           chmod 755 dist/mybeast-*
           (cd dist && sha256sum mybeast-* > SHA256SUMS && cat SHA256SUMS)
       - name: The release

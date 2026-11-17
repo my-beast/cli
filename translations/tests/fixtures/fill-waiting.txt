@@ -1,0 +1,2 @@
+fill 7 waiting 1 2 0
+The Starter package has room for 2,000,000 characters a month, and they are used up.

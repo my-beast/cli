@@ -1,0 +1,6 @@
+failed
+3 strings checked
+Finnish (fi): 1 missing, 1 fail a check
+Swedish (sv): whole and sound
+resources/js/locales/fi.json: common.hello - placeholders: missing {{name}}; extra {{nimi}}
+resources/js/locales/fi.json: money.title - missing

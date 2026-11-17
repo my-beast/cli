@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `mybeast-translations` (1), a fourth command: an app's own words in and out of its repo with My Beast
+  Translations. `push` sends every language file as it is (i18next's JSON, plain JSON, Laravel's `lang/{lang}.json`;
+  as gzip when gzip is there), `pull` writes the other languages back the way the source file is written, `check`
+  ends 1 for CI when a language misses keys or a text fails a check, and `status` says how the strings stand. A file
+  in the repo, `.mybeast-translations`, names the source language and the files. See `translations/README.md`.
+
 ## 0.2.0 - 2026-11-14
 
 - `mybeast-deploy job` (mybeast-deploy 3): the job behind **Roll back** on the Deploys page. Cron runs it every

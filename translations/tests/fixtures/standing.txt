@@ -1,0 +1,4 @@
+3 strings, written in English (en)
+Finnish (fi), use at once: 1 reviewed, 2 machine, 0 outdated, 0 missing, 0 held for a person
+Swedish (sv), after review: 0 reviewed, 2 machine, 0 outdated, 1 missing, 0 held for a person
+fill 7 running 1 2 0

@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+# mybeast-translations - an app's own words in and out of its repo, with My Beast Translations: the language files go
+# to the service as they are, people review the words there, and the reviewed words come back into the files.
+#
+#   mybeast-translations push [--prune] [--existing machine|reviewed] [--branch NAME] [--wait[=SECONDS]]
+#   mybeast-translations pull
+#   mybeast-translations check
+#   mybeast-translations status
+#
+# Reads .mybeast-translations in the folder it runs in (the repo's root): the source language and the files, with
+# {lang} where the language goes -
+#
+#   source en
+#   file resources/js/locales/{lang}.json i18next
+#   file lang/{lang}.json laravel-json
+#
+# - and MYBEAST_TRANSLATIONS_URL (e.g. https://services.my-beast.com/translations) and MYBEAST_TRANSLATIONS_SECRET
+# (sk_….…, the project's Settings → Keys, or the one id put in Secrets), from the environment or from
+# ~/.config/mybeast/translations.env. Bash and curl, nothing else (gzip is used when it is there); bash 3.2 (macOS) and
+# up. The secret goes to curl on its standard input, never on its command line.
+#
+# The formats are JSON's: i18next (nested or flat, with its plural keys), json (no plural rule) and laravel-json
+# (Laravel's lang/{lang}.json). Laravel's PHP files are read by the app itself: composer require
+# mybeast/translations-laravel. Exit codes: 0 done (a check: every language whole and sound), 1 a check found
+# something, 2 its own refusals (a bad option, no settings, no file), 3 the service did not take it.
+
+set -euo pipefail
+
+VERSION=1
+SELF=${0##*/}
+CONFIG_HINT='~/.config/mybeast/translations.env'
+WORK=
+
+say() { printf '%s: %s\n' "$SELF" "$*" >&2; }
+die() {
+    say "$*"
+    exit 2
+}
+
+usage() {
+    cat <<EOF
+$SELF $VERSION - an app's own words in and out of its repo, with My Beast Translations
+
+  $SELF push [--prune] [--existing machine|reviewed] [--branch NAME] [--wait[=SECONDS]]
+      Sends every language file as it is. New keys are added and translated, changed ones marked; what the repo has
+      in other languages is taken as the machine's words, never over words a person reviewed.
+      --prune      archive the keys the files no longer have (the main branch's push; never a feature branch's)
+      --existing   on a first push, what the other languages in the repo are: machine (the default) or reviewed
+      --wait       wait until the machine has written what was missing (10 minutes at most, or SECONDS)
+
+  $SELF pull
+      Writes each file in every other language: the reviewed words, and the machine's where the language uses them
+      at once. Written as the source file is; the source language's file is never touched.
+
+  $SELF check
+      Sends the files and changes nothing: ends with 1 when a language misses keys or a text fails a check.
+
+  $SELF status
+      How the project's strings stand.
+
+Needs .mybeast-translations here (source and file lines), and MYBEAST_TRANSLATIONS_URL and
+MYBEAST_TRANSLATIONS_SECRET (a server key: the project's Settings → Keys), exported or in ${CONFIG_HINT}.
+Ends with 0, 1 (a check found something), 2 (its own refusals) or 3 (the service did not take it).
+EOF
+}
+
+cleanup() {
+    if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
+}
+trap cleanup EXIT
+
+# ------------------------------------------------------------------------------------------------------- settings
+
+# A KEY=VALUE file is read, never sourced; it must be readable by its owner only.
+config_value() { # $1 file, $2 name
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line#export }
+        case $line in
+            "$2"=*)
+                line=${line#"$2"=}
+                line=${line%\"}
+                line=${line#\"}
+                line=${line%\'}
+                line=${line#\'}
+                printf '%s' "$line"
+                return 0
+                ;;
+        esac
+    done <"$1"
+}
+
+settings() {
+    local file=${MYBEAST_TRANSLATIONS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/mybeast/translations.env}
+
+    # The name Secrets gives the server key (MYBEAST_TRANSLATIONS_SECRET); _KEY as the other commands call it.
+    : "${MYBEAST_TRANSLATIONS_SECRET:=${MYBEAST_TRANSLATIONS_KEY:-}}"
+
+    if { [ -z "${MYBEAST_TRANSLATIONS_URL:-}" ] || [ -z "$MYBEAST_TRANSLATIONS_SECRET" ]; } && [ -f "$file" ]; then
+        if [ -n "$(find "$file" -prune \( -perm -004 -o -perm -040 \) 2>/dev/null)" ]; then
+            die "$file can be read by others: chmod 600 $file"
+        fi
+        : "${MYBEAST_TRANSLATIONS_URL:=$(config_value "$file" MYBEAST_TRANSLATIONS_URL)}"
+        [ -n "$MYBEAST_TRANSLATIONS_SECRET" ] || MYBEAST_TRANSLATIONS_SECRET=$(config_value "$file" MYBEAST_TRANSLATIONS_SECRET)
+        [ -n "$MYBEAST_TRANSLATIONS_SECRET" ] || MYBEAST_TRANSLATIONS_SECRET=$(config_value "$file" MYBEAST_TRANSLATIONS_KEY)
+    fi
+
+    [ -n "${MYBEAST_TRANSLATIONS_URL:-}" ] || die "MYBEAST_TRANSLATIONS_URL is not set (e.g. https://services.my-beast.com/translations), nor in $CONFIG_HINT"
+    [ -n "$MYBEAST_TRANSLATIONS_SECRET" ] || die "MYBEAST_TRANSLATIONS_SECRET is not set (a server key: the project's Settings → Keys), nor in $CONFIG_HINT"
+    case $MYBEAST_TRANSLATIONS_URL in
+        https://* | http://localhost* | http://127.0.0.1* | http://*.localhost* | http://*.test*) ;;
+        *) die "MYBEAST_TRANSLATIONS_URL must be https:// (plain http only for localhost, *.localhost and *.test)" ;;
+    esac
+    [[ $MYBEAST_TRANSLATIONS_SECRET =~ ^sk_[a-z0-9]+\.[A-Za-z0-9_-]+$ ]] || die "MYBEAST_TRANSLATIONS_SECRET does not look like a server key (sk_….…)"
+    command -v curl >/dev/null 2>&1 || die "curl is needed"
+
+    URL=${MYBEAST_TRANSLATIONS_URL%/}
+    KEY=$MYBEAST_TRANSLATIONS_SECRET
+    WORK=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/mybeast-translations.XXXXXX")
+}
+
+# ---------------------------------------------------------------------------------------- the repo's own file
+
+# .mybeast-translations: `source CODE` and `file PATTERN FORMAT` lines → SOURCE, PATTERNS and FORMATS.
+repo() {
+    local file=${MYBEAST_TRANSLATIONS_FILE:-.mybeast-translations} line word pattern format rest n=0
+    SOURCE=''
+    PATTERNS=()
+    FORMATS=()
+    [ -f "$file" ] || die "no $file here ($(pwd)): it names the source language and the files, e.g.
+  source en
+  file resources/js/locales/{lang}.json i18next"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        line=${line%%#*}
+        # Split into words, with no file name ever expanded from one.
+        set -f
+        # shellcheck disable=SC2086
+        set -- $line
+        set +f
+        [ $# -gt 0 ] || continue
+        word=$1
+        case $word in
+            source)
+                [ $# -eq 2 ] || die "$file line $n: source takes one language, e.g. source en"
+                [[ $2 =~ ^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,8})*$ ]] || die "$file line $n: $2 is not a language code such as en or pt-BR"
+                SOURCE=$2
+                ;;
+            file)
+                [ $# -eq 3 ] || die "$file line $n: file takes a path with {lang} and a format, e.g. file locales/{lang}.json i18next"
+                pattern=$2
+                format=$3
+                rest=${pattern/\{lang\}/}
+                case $pattern in
+                    /* | *..* | *\\*) die "$file line $n: $pattern must be a path inside the repo" ;;
+                esac
+                [ "$rest" != "$pattern" ] && [[ $rest != *[{}]* ]] || die "$file line $n: $pattern needs {lang} once, where the language goes"
+                [[ $pattern =~ ^[A-Za-z0-9_@./{}-]+$ ]] || die "$file line $n: $pattern has a character a file's name here cannot have"
+                case $format in
+                    i18next | json | laravel-json) ;;
+                    laravel) die "$file line $n: Laravel's PHP files are read by the app itself: composer require mybeast/translations-laravel" ;;
+                    *) die "$file line $n: the format is i18next, json or laravel-json" ;;
+                esac
+                PATTERNS+=("$pattern")
+                FORMATS+=("$format")
+                ;;
+            *) die "$file line $n: a line is \"source CODE\" or \"file PATH FORMAT\"" ;;
+        esac
+    done <"$file"
+
+    [ -n "$SOURCE" ] || die "$file has no source line, e.g. source en"
+    [ ${#PATTERNS[@]} -gt 0 ] || die "$file has no file line, e.g. file locales/{lang}.json i18next"
+}
+
+# The languages a pattern has files for here, one a line, as they are spelled on disk.
+languages_here() { # $1 pattern
+    local before=${1%%\{lang\}*} after=${1#*\{lang\}} path lang
+    for path in "$before"*"$after"; do
+        [ -f "$path" ] || continue
+        lang=${path#"$before"}
+        lang=${lang%"$after"}
+        [[ $lang =~ ^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,8})*$ ]] || continue
+        printf '%s\n' "$lang"
+    done
+}
+
+path_of() { printf '%s' "${1/\{lang\}/$2}"; } # $1 pattern, $2 language
+
+# ------------------------------------------------------------------------------------------------------- the API
+
+# api METHOD PATH OUT [CURL ARGS...] → the HTTP status on stdout (000: no answer); the body in OUT.
+api() {
+    local method=$1 path=$2 out=$3 code
+    shift 3
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$KEY" |
+        curl --silent --show-error --proto '=https,http' --max-time 300 --connect-timeout 10 --config - \
+            --header 'Accept: application/json, text/plain' --header "User-Agent: $SELF/$VERSION" \
+            --request "$method" --output "$out" --write-out '%{http_code}' \
+            "$@" "$URL$path" 2>>"$WORK/curl.log") || true
+    printf '%s' "${code:-000}"
+}
+
+# A value for a query string, every byte that is not plainly safe as %XX.
+encoded() {
+    local LC_ALL=C text=$1 out='' i char
+    for ((i = 0; i < ${#text}; i++)); do
+        char=${text:i:1}
+        case $char in
+            [A-Za-z0-9._~-]) out+=$char ;;
+            *) out+=$(printf '%%%02X' "'$char") ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# What the service answered, fit to print: no control character but the line break and the tab.
+printable() { LC_ALL=C tr -d '\000-\010\013-\037\177' <"$1"; }
+
+# The service's word on a refusal, for the person: its own plain words, or the message of a JSON answer.
+said() { # $1 code, $2 file
+    local body message='' re='"message":"(([^"\\]|\\.)*)"'
+    body=$(printable "$2" 2>/dev/null || true)
+    case $body in
+        '{'*) if [[ $body =~ $re ]]; then message=${BASH_REMATCH[1]//\\\//\/}; fi ;;
+        *) message=$body ;;
+    esac
+    case $1 in
+        000) printf 'could not reach %s (%s)' "$URL" "$(tail -1 "$WORK/curl.log" 2>/dev/null | sed 's/^curl: //')" ;;
+        401) printf 'the secret was refused: revoked, mistyped, or not a Translations key of %s' "$URL" ;;
+        413) printf 'a file is larger than %s takes' "$URL" ;;
+        429) printf 'too many calls just now; try again in a minute' ;;
+        *) printf '%s answered %s%s' "$URL" "$1" "${message:+: $message}" ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------------------- sending the files
+
+# Starts a push with this JSON body, sends every file there is here, and finishes it: the answer in $WORK/answer.
+send() { # $1 the start's body
+    local code id i pattern format lang code_lang path body sent=0 found
+
+    # Every file's source language must be here before anything is started.
+    for ((i = 0; i < ${#PATTERNS[@]}; i++)); do
+        [ -f "$(path_of "${PATTERNS[$i]}" "$SOURCE")" ] || die "$(path_of "${PATTERNS[$i]}" "$SOURCE") is not here: the $SOURCE file of ${PATTERNS[$i]}"
+    done
+
+    code=$(api POST /api/v1/strings/pushes "$WORK/start" --header 'Content-Type: application/json' --data-binary "$1")
+    [ "$code" = 201 ] || { say "not started: $(said "$code" "$WORK/start")"; exit 3; }
+    id=$(printable "$WORK/start" | head -1)
+    [[ $id =~ ^[0-9a-f-]{36}$ ]] || { say "not started: $URL answered something that is no push"; exit 3; }
+
+    for ((i = 0; i < ${#PATTERNS[@]}; i++)); do
+        pattern=${PATTERNS[$i]}
+        format=${FORMATS[$i]}
+        found=$(languages_here "$pattern")
+
+        while IFS= read -r lang; do
+            [ -n "$lang" ] || continue
+            path=$(path_of "$pattern" "$lang")
+            [ -r "$path" ] || die "$path cannot be read"
+            # pt_BR on disk is pt-BR to the service.
+            code_lang=${lang//_/-}
+            body=$path
+
+            if command -v gzip >/dev/null 2>&1; then
+                gzip -c -- "$path" >"$WORK/body.gz"
+                code=$(api PUT "/api/v1/strings/pushes/$id/files?file=$(encoded "$pattern")&language=$(encoded "$code_lang")&format=$format" "$WORK/sent" \
+                    --header 'Content-Type: application/json' --header 'Content-Encoding: gzip' --data-binary "@$WORK/body.gz")
+            else
+                code=$(api PUT "/api/v1/strings/pushes/$id/files?file=$(encoded "$pattern")&language=$(encoded "$code_lang")&format=$format" "$WORK/sent" \
+                    --header 'Content-Type: application/json' --data-binary "@$body")
+            fi
+
+            [ "$code" = 200 ] || { say "$path was not taken: $(said "$code" "$WORK/sent")"; exit 3; }
+            sent=$((sent + 1))
+        done <<EOF
+$found
+EOF
+    done
+
+    code=$(api POST "/api/v1/strings/pushes/$id/finish" "$WORK/answer")
+    [ "$code" = 200 ] || { say "not finished, nothing changed: $(said "$code" "$WORK/answer")"; exit 3; }
+    SENT=$sent
+}
+
+# The answer's lines for the person: all but the first (its word) and the fill's own line.
+lines() {
+    printable "$WORK/answer" | sed -e 1d -e '/^fill [0-9][0-9]* [a-z][a-z]* [0-9][0-9]* [0-9][0-9]* [0-9][0-9]*$/d'
+}
+
+# ------------------------------------------------------------------------------------------------- the commands
+
+push() {
+    local prune=false existing=machine branch='' wait=0 body fill id state done_ total held code waited=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --prune) prune=true; shift ;;
+            --existing) [ $# -ge 2 ] || die "--existing needs machine or reviewed"; existing=$2; shift 2 ;;
+            --existing=*) existing=${1#--existing=}; shift ;;
+            --branch) [ $# -ge 2 ] || die "--branch needs a name"; branch=$2; shift 2 ;;
+            --branch=*) branch=${1#--branch=}; shift ;;
+            --wait) wait=600; shift ;;
+            --wait=*) wait=${1#--wait=}; shift ;;
+            -h | --help) usage; exit 0 ;;
+            *) die "push does not take $1 (see $SELF --help)" ;;
+        esac
+    done
+    case $existing in
+        machine | reviewed) ;;
+        *) die "--existing: machine or reviewed" ;;
+    esac
+    [[ $wait =~ ^[0-9]{1,5}$ ]] || die "--wait: a number of seconds"
+
+    repo
+    settings
+
+    # The branch as git says, or the CI's own word; only a name that needs no escaping is sent.
+    if [ -z "$branch" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        branch=$(git symbolic-ref --short --quiet HEAD 2>/dev/null || true)
+    fi
+    [ -n "$branch" ] || branch=${GITHUB_REF_NAME:-${CI_COMMIT_REF_NAME:-}}
+    [[ $branch =~ ^[A-Za-z0-9._/-]{1,190}$ ]] || branch=''
+
+    body="{\"prune\":$prune,\"existing\":\"$existing\"${branch:+,\"branch\":\"$branch\"}}"
+    send "$body"
+    [ "$(printable "$WORK/answer" | head -1)" = pushed ] || { say "$URL answered something that is no push's answer"; exit 3; }
+    printf '%s files sent.\n' "$SENT"
+    lines
+
+    fill=$(printable "$WORK/answer" | grep -E '^fill [0-9]+ [a-z]+ [0-9]+ [0-9]+ [0-9]+$' | tail -1 || true)
+    [ -n "$fill" ] && [ "$wait" -gt 0 ] || return 0
+
+    # shellcheck disable=SC2086
+    set -- $fill
+    id=$2
+    state=$3
+    while [ "$state" = queued ] || [ "$state" = running ]; do
+        [ "$waited" -lt "$wait" ] || { say "still writing after $wait seconds; it goes on there ($SELF status)"; return 0; }
+        sleep 3
+        waited=$((waited + 3))
+        code=$(api GET "/api/v1/strings/fills/$id" "$WORK/fill")
+        [ "$code" = 200 ] || { say "$(said "$code" "$WORK/fill")"; exit 3; }
+        # shellcheck disable=SC2046
+        set -- $(printable "$WORK/fill" | head -1)
+        state=${3:-}
+        done_=${4:-0}
+        total=${5:-0}
+        held=${6:-0}
+        printf '\r%s of %s written' "$done_" "$total" >&2
+    done
+    [ "$waited" = 0 ] || printf '\n' >&2
+
+    case $state in
+        done) printf 'The machine has written what was missing%s.\n' "$([ "${held:-0}" = 0 ] || printf ', %s held for a person' "$held")" ;;
+        waiting) printf 'The machine waits: %s\n' "$(printable "$WORK/fill" 2>/dev/null | sed -n 2p)" ;;
+    esac
+}
+
+check() {
+    local word
+    case ${1:-} in
+        '') ;;
+        -h | --help) usage; exit 0 ;;
+        *) die "check does not take $1 (see $SELF --help)" ;;
+    esac
+    repo
+    settings
+    send '{"check":true}'
+    word=$(printable "$WORK/answer" | head -1)
+    lines
+
+    case $word in
+        ok) return 0 ;;
+        failed) exit 1 ;;
+        *) say "$URL answered something that is no check's answer"; exit 3 ;;
+    esac
+}
+
+pull() {
+    local code file format langs strings i pattern lang path dir tmp found wrote=0 here spelled
+    case ${1:-} in
+        '') ;;
+        -h | --help) usage; exit 0 ;;
+        *) die "pull does not take $1 (see $SELF --help)" ;;
+    esac
+    repo
+    settings
+
+    code=$(api GET /api/v1/strings/files "$WORK/files")
+    [ "$code" = 200 ] || { say "$(said "$code" "$WORK/files")"; exit 3; }
+
+    for ((i = 0; i < ${#PATTERNS[@]}; i++)); do
+        pattern=${PATTERNS[$i]}
+        found=0
+        here=$(languages_here "$pattern")
+
+        while IFS=$'\t' read -r file format langs strings || [ -n "$file" ]; do
+            [ "$file" = "$pattern" ] || continue
+            found=1
+
+            for lang in ${langs//,/ }; do
+                [[ $lang =~ ^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$ ]] || continue
+                # A language the repo spells its own way (pt_BR) keeps its file.
+                spelled=$lang
+                if [ ! -f "$(path_of "$pattern" "$lang")" ] && printf '%s\n' "$here" | grep -qx -- "${lang//-/_}"; then
+                    spelled=${lang//-/_}
+                fi
+                [ "$spelled" != "$SOURCE" ] || continue
+                path=$(path_of "$pattern" "$spelled")
+                dir=$(dirname -- "$path")
+                mkdir -p -- "$dir"
+                # Written next to its place and moved there whole: nothing ever reads half a file.
+                tmp=$(mktemp "$dir/.mybeast-translations.XXXXXX") || die "cannot write in $dir"
+                code=$(api GET "/api/v1/strings/pull?file=$(encoded "$pattern")&language=$(encoded "$lang")" "$tmp")
+                if [ "$code" != 200 ]; then
+                    say "$path was not written: $(said "$code" "$tmp")"
+                    rm -f -- "$tmp"
+                    exit 3
+                fi
+                # Nothing to serve yet: no empty file is made, and words that are here are never replaced by none.
+                if [ "$(printable "$tmp" | tr -d ' \t\r\n')" = '{}' ]; then
+                    rm -f -- "$tmp"
+                    [ ! -f "$path" ] || printf 'left %s as it is: the service has no words to serve for it yet\n' "$path"
+                    continue
+                fi
+                chmod 644 "$tmp"
+                mv -f -- "$tmp" "$path"
+                printf 'wrote %s\n' "$path"
+                wrote=$((wrote + 1))
+            done
+        done <"$WORK/files"
+
+        [ $found = 1 ] || say "note: the service has no $pattern yet: push it first"
+    done
+
+    [ $wrote -gt 0 ] || say "nothing to write: the project has no other language for these files yet"
+}
+
+status() {
+    local code
+    case ${1:-} in
+        '') ;;
+        -h | --help) usage; exit 0 ;;
+        *) die "status does not take $1 (see $SELF --help)" ;;
+    esac
+    settings
+    code=$(api GET /api/v1/strings "$WORK/answer")
+    [ "$code" = 200 ] || { say "$(said "$code" "$WORK/answer")"; exit 3; }
+    printable "$WORK/answer" | sed -E 's/^fill [0-9]+ ([a-z]+) ([0-9]+) ([0-9]+) ([0-9]+)$/The machine: \1, \2 of \3 written, \4 held for a person/'
+}
+
+MODE=${1:-}
+case $MODE in
+    push) shift; push "$@" ;;
+    pull) shift; pull "$@" ;;
+    check) shift; check "$@" ;;
+    status) shift; status "$@" ;;
+    -h | --help | help | '') usage ;;
+    -v | --version) printf '%s %s\n' "$SELF" "$VERSION" ;;
+    *) die "unknown command $MODE (see $SELF --help)" ;;
+esac

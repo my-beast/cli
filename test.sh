@@ -5,7 +5,7 @@ set -u
 
 cd "$(dirname "$0")" || exit 1
 status=0
-for tool in deploy secrets vulnerabilities; do
+for tool in deploy secrets translations vulnerabilities; do
     printf '%s: ' "$tool"
     /bin/bash "$tool/tests/run.sh" || status=1
 done

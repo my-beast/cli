@@ -1,0 +1,6 @@
+pushed
+resources/js/locales/{lang}.json: 3 strings, 1 added, 1 changed
+Finnish (fi): 1 taken from the repo, 1 proposed beside reviewed words
+Swedish (sv): 2 missing - added to the project
+The machine is writing 2 texts in the background.
+fill 7 queued 0 2 0
