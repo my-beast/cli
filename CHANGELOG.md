@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-11-17
 
 - `mybeast-translations` (1), a fourth command: an app's own words in and out of its repo with My Beast
   Translations. `push` sends every language file as it is (i18next's JSON, plain JSON, Laravel's `lang/{lang}.json`;
